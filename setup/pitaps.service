@@ -1,0 +1,31 @@
+[Unit]
+Description=piTaps Card Reader Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pitaps
+WorkingDirectory=/opt/pitaps
+
+# Load environment variables from .env file
+EnvironmentFile=/opt/pitaps/.env
+
+# Pull latest code from GitHub and install any new dependencies before starting.
+# This provides automatic over-the-air updates on every reboot.
+ExecStartPre=/usr/bin/git -C /opt/pitaps pull --quiet
+ExecStartPre=/usr/bin/npm --prefix /opt/pitaps install --quiet --omit=dev
+
+ExecStart=/usr/bin/node /opt/pitaps/index.js
+
+# Restart automatically if the process exits or crashes
+Restart=always
+RestartSec=5
+
+# Send output to systemd journal (view with: journalctl -u pitaps -f)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pitaps
+
+[Install]
+WantedBy=multi-user.target

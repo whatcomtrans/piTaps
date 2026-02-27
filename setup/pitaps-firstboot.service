@@ -1,0 +1,17 @@
+[Unit]
+Description=piTaps First-Boot Setup
+# Run before the main pitaps service
+Before=pitaps.service
+# Run after the network is up so git clone works
+After=network-online.target
+Wants=network-online.target
+# Only run when this service is explicitly enabled
+ConditionPathExists=/etc/systemd/system/pitaps-firstboot.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/pitaps/setup/first-boot.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
