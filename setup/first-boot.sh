@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-BOOT=/boot          # Raspberry Pi OS Bullseye (32-bit). Bookworm uses /boot/firmware
+BOOT=/boot/firmware  # Raspberry Pi OS Bookworm / Trixie mount point for the FAT32 boot partition
 INSTALL=/opt/pitaps
 LOG=/var/log/pitaps-firstboot.log
 

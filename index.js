@@ -358,7 +358,7 @@ class SerialCardReader {
         autoOpen: false,
       });
 
-      const parser = this._port.pipe(new ReadlineParser({ delimiter: '\n' }));
+      const parser = this._port.pipe(new ReadlineParser({ delimiter: '\r' }));
 
       parser.on('data', (line) => {
         const cardNumber = line.trim();

@@ -24,7 +24,7 @@ Reads card taps from an Elatec TWN4 MultiTech2 USB card reader, queues them loca
 
 1. Open **Raspberry Pi Imager** on your PC.
 2. Click **Choose OS** → **Raspberry Pi OS (other)** → **Raspberry Pi OS Lite (32-bit)**.
-   > Use the **Legacy** (Bullseye) version for maximum compatibility with the Pi 2's ARMv7 processor.
+   > In Raspberry Pi Imager the entry is described as *"a port of Debian Trixie with no desktop environment"*. Select that — do **not** look for a "Legacy" or "Bullseye" label, as the imager doesn't use those terms in the description.
 3. Click **Choose Storage** and select your SD card.
 4. Click the **gear icon** (⚙) to open OS Customization settings:
    - **Set hostname**: `pitaps` *(every Pi in the fleet uses the same hostname — vehicle identity comes from the router, not the Pi)*
@@ -50,7 +50,9 @@ ROUTER_API_USERNAME=
 ROUTER_API_PASSWORD=
 ```
 
-Copy `pitaps.env` to the **root of the boot partition** (the drive that appears as `bootfs` or `boot`).
+Copy `pitaps.env` to the **root of the boot partition** (the drive that appears as `bootfs` or `boot` when mounted on your PC).
+
+> On Raspberry Pi OS Trixie the boot partition is mounted at `/boot/firmware` on the running Pi — not `/boot`. If you ever need to access it from the Pi itself, use that path.
 
 > **This file is identical for every Pi in the fleet.** Vehicle identity (bus number) is read at runtime from the Cradlepoint router's SDK appdata — no per-Pi customization is needed on the SD card.
 
@@ -74,25 +76,31 @@ ssh pitaps@pitaps.local
 
 ## Step 4 — Static IP Address
 
-Assign the Pi a static IP of `192.168.0.11` on the Ethernet interface.
+Assign the Pi a static IP of `192.168.0.11` on the Ethernet interface. Raspberry Pi OS (Debian Trixie) uses **NetworkManager** — the `dhcpcd` service is not present.
+
+First, confirm the connection name (it will be `netplan-eth0` on a fresh Trixie image):
 
 ```bash
-sudo nano /etc/dhcpcd.conf
+nmcli con show
 ```
 
-Add at the bottom:
-
-```
-interface eth0
-static ip_address=192.168.0.11/24
-static routers=192.168.0.1
-static domain_name_servers=8.8.8.8 8.8.4.4
-```
-
-Reboot:
+Then apply the static IP configuration using that connection name:
 
 ```bash
-sudo reboot
+sudo nmcli con mod "netplan-eth0" \
+  ipv4.method manual \
+  ipv4.addresses 192.168.0.11/24 \
+  ipv4.gateway 192.168.0.1 \
+  ipv4.dns "8.8.8.8 8.8.4.4"
+
+sudo nmcli con up "netplan-eth0"
+```
+
+The change takes effect immediately — no reboot required. Verify:
+
+```bash
+ip addr show eth0
+# Should show inet 192.168.0.11/24
 ```
 
 From now on SSH using the static IP:
@@ -105,11 +113,27 @@ ssh pitaps@192.168.0.11
 
 ## Step 5 — Install Node.js
 
-Install Node.js 20 LTS using the NodeSource setup script (supports ARMv7):
+> **Note:** NodeSource does not support `armhf` (32-bit ARMv7). Do not use the NodeSource setup script — it will fail with an "Unsupported architecture" error on the Pi 2.
+
+### Option A — Debian repository (try this first)
 
 ```bash
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-sudo apt-get install -y nodejs
+sudo apt update && sudo apt install -y nodejs npm
+node --version
+```
+
+If this prints `v18.x` or higher, you're done. Proceed to Step 6.
+
+### Option B — Official Node.js binary (if Option A gives an older version)
+
+The nodejs.org distribution site provides official `armv7l` binaries for all LTS releases. Check [nodejs.org/en/download](https://nodejs.org/en/download) for the current LTS version number, then:
+
+```bash
+NODE_VERSION="v20.18.3"   # replace with current LTS from nodejs.org if newer
+wget -q https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-linux-armv7l.tar.xz
+tar -xf node-${NODE_VERSION}-linux-armv7l.tar.xz
+sudo cp -r node-${NODE_VERSION}-linux-armv7l/. /usr/local/
+rm -rf node-${NODE_VERSION}-linux-armv7l node-${NODE_VERSION}-linux-armv7l.tar.xz
 ```
 
 Verify:
@@ -138,7 +162,7 @@ Copy your `.env` file into place (if the first-boot script hasn't already done s
 
 ```bash
 # Only needed if you're doing a manual install (not using the golden image workflow)
-sudo cp /boot/pitaps.env /opt/pitaps/.env
+sudo cp /boot/firmware/pitaps.env /opt/pitaps/.env
 sudo chown pitaps:pitaps /opt/pitaps/.env
 sudo chmod 600 /opt/pitaps/.env
 ```
