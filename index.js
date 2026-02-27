@@ -188,12 +188,14 @@ async function fetchGps() {
   const result = await routerRequest('/api/status/gps', 3_000);
 
   if (result.ok) {
+    log(`[GPS] Raw response: ${JSON.stringify(result.data)}`);
     const gps = result.data?.data ?? result.data;
     const latitude = gps?.latitude ?? null;
     const longitude = gps?.longitude ?? null;
     return { latitude, longitude };
   }
 
+  log(`[GPS] Request failed: ${result.error}`);
   return { latitude: null, longitude: null };
 }
 
