@@ -22,6 +22,7 @@ const CONFIG = {
   serialBaud: 9600,         // Must match Elatec output baud rate
   minCardLength: 4,
   maxCardLength: 20,
+  cardCooldownMs: 2_000,    // ignore re-reads of the same card within this window
   batchIntervalMs: 30_000,  // ms between batch send attempts
   maxQueueSize: 10_000,
   deviceScanIntervalMs: 5_000,
@@ -32,6 +33,9 @@ if (!CONFIG.serverUrl || !CONFIG.apiKey) {
   console.error('FATAL: SERVER_URL and API_KEY must be set in .env — see .env.example');
   process.exit(1);
 }
+
+// Tracks last-seen timestamp (ms) per card number for cooldown enforcement.
+const recentCards = new Map();
 
 // --- Logging -----------------------------------------------------------------
 
@@ -228,6 +232,19 @@ async function processCard(cardNumber, devicePath, tapQueue, busNumber) {
     return false;
   }
 
+  // Cooldown: ignore re-reads of the same card within the cooldown window.
+  const now = Date.now();
+  const lastSeen = recentCards.get(cardNumber) ?? 0;
+  if (now - lastSeen < CONFIG.cardCooldownMs) {
+    log(`[Process] DUPLICATE - ${cardNumber} seen ${now - lastSeen}ms ago, ignoring`);
+    return false;
+  }
+  recentCards.set(cardNumber, now);
+  // Prune entries older than the cooldown so the map doesn't grow unbounded.
+  for (const [card, ts] of recentCards) {
+    if (now - ts > CONFIG.cardCooldownMs) recentCards.delete(card);
+  }
+
   log(`[Process] ACCEPTED - ${cardNumber} (${reason})`);
 
   const { latitude, longitude } = await fetchGps();
@@ -275,10 +292,22 @@ class BatchSender {
       return;
     }
 
-    const batch = this._queue.getBatch();
-    if (batch.length === 0) {
+    const raw = this._queue.getBatch();
+    if (raw.length === 0) {
       log('[BatchSender] No taps to send. Queue empty.');
       return;
+    }
+
+    // Deduplicate by card_number + timestamp_utc before sending.
+    const seen = new Set();
+    const batch = raw.filter((tap) => {
+      const key = `${tap.card_number}|${tap.timestamp_utc}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    if (batch.length < raw.length) {
+      log(`[BatchSender] Removed ${raw.length - batch.length} duplicate tap(s) before send`);
     }
 
     this._sending = true;
@@ -314,8 +343,10 @@ class BatchSender {
         this._sending = false;
         if (res.statusCode >= 200 && res.statusCode < 300) {
           log(`[BatchSender] SUCCESS - HTTP ${res.statusCode}, ${batch.length} taps delivered`);
+        } else if (res.statusCode >= 400 && res.statusCode < 500) {
+          log(`[BatchSender] DROPPED - HTTP ${res.statusCode} (bad request, batch discarded): ${body}`);
         } else {
-          log(`[BatchSender] FAILED - HTTP ${res.statusCode}: ${body}`);
+          log(`[BatchSender] FAILED - HTTP ${res.statusCode} (server error, will retry): ${body}`);
           this._queue.requeue(batch);
         }
       });
