@@ -158,31 +158,23 @@ function routerRequest(apiPath, timeoutMs = 5_000) {
 // --- Vehicle ID --------------------------------------------------------------
 
 async function fetchVehicleId() {
-  log('[Config] Fetching vehicleID from router appdata...');
+  log('[Config] Fetching system_id from router...');
 
-  const result = await routerRequest('/api/config/system/sdk/appdata');
+  const result = await routerRequest('/api/config/system/system_id');
 
   if (result.ok) {
-    const appdata = result.data?.data ?? result.data;
-
-    if (appdata && typeof appdata === 'object') {
-      if (!Array.isArray(appdata) && appdata.vehicleID) {
-        log(`[Config] vehicleID found: ${appdata.vehicleID}`);
-        return String(appdata.vehicleID);
-      }
-      if (Array.isArray(appdata)) {
-        const item = appdata.find((x) => x.name === 'vehicleID');
-        if (item?.value) {
-          log(`[Config] vehicleID found: ${item.value}`);
-          return String(item.value);
-        }
-      }
+    log(`[Config] Raw system_id response: ${JSON.stringify(result.data)}`);
+    const value = result.data?.data ?? result.data;
+    const str = (value !== null && value !== undefined) ? String(value).trim() : '';
+    if (str) {
+      log(`[Config] vehicleID: ${str}`);
+      return str;
     }
   } else {
-    log(`[Config] ERROR fetching vehicleID: ${result.error}`);
+    log(`[Config] ERROR fetching system_id: ${result.error}`);
   }
 
-  log('[Config] WARNING - vehicleID not found, defaulting to UNKNOWN');
+  log('[Config] WARNING - system_id not found, defaulting to UNKNOWN');
   return 'UNKNOWN';
 }
 
