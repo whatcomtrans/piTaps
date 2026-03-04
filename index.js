@@ -6,7 +6,6 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const http = require('http');
-const dgram = require('dgram');
 const { SerialPort } = require('serialport');
 const { ReadlineParser } = require('@serialport/parser-readline');
 
@@ -545,20 +544,6 @@ async function main() {
 
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
-
-  // ---- UDP LISTENER (experimental) ----------------------------------------
-  const udpSocket = dgram.createSocket('udp4');
-  udpSocket.on('message', (msg, rinfo) => {
-    console.log(`[UDP] ${rinfo.address}:${rinfo.port} — ${msg.toString()}`);
-  });
-  udpSocket.on('error', (err) => {
-    log(`[UDP] Socket error: ${err.message}`);
-    udpSocket.close();
-  });
-  udpSocket.bind(34952, () => {
-    log(`[UDP] Listening on port ${udpSocket.address().port}`);
-  });
-  // ---- END UDP LISTENER ----------------------------------------------------
 
   log('=== piTaps App Running ===');
 }
