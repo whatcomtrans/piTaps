@@ -279,6 +279,7 @@ class GtfsRtCache {
     }
 
     const busStr = String(busNumber);
+    let fields = null;
 
     // Try vehicles feed first — has route, trip, and current stop_id
     if (this._vehiclesFeed?.entity) {
@@ -286,32 +287,45 @@ class GtfsRtCache {
         const veh = entity.vehicle;
         if (!veh) continue;
         if (String(veh.vehicle?.id ?? '') === busStr) {
-          log(`[GTFS-RT] Matched bus ${busStr} in vehicles feed`);
-          return {
-            gtfs:     'match',
+          log(`[GTFS-RT] Found bus ${busStr} in vehicles feed`);
+          fields = {
             route_id: veh.trip?.route_id ?? null,
             trip_id:  veh.trip?.trip_id  ?? null,
             stop_id:  veh.stop_id        ?? null,
           };
+          break;
         }
       }
     }
 
-    // Fall back to trips feed
-    if (this._tripsFeed?.entity) {
+    // Try trips feed if any fields are still null (or bus wasn't in vehicles feed)
+    const needsTrips = !fields || fields.route_id === null || fields.trip_id === null || fields.stop_id === null;
+    if (needsTrips && this._tripsFeed?.entity) {
       for (const entity of this._tripsFeed.entity) {
         const tu = entity.trip_update;
         if (!tu) continue;
         if (String(tu.vehicle?.id ?? '') === busStr) {
-          log(`[GTFS-RT] Matched bus ${busStr} in trips feed`);
-          return {
-            gtfs:     'match',
-            route_id: tu.trip?.route_id               ?? null,
-            trip_id:  tu.trip?.trip_id                ?? null,
-            stop_id:  tu.stop_time_update?.[0]?.stop_id ?? null,
-          };
+          log(`[GTFS-RT] Found bus ${busStr} in trips feed`);
+          const stopId = tu.stop_time_update?.[0]?.stop_id ?? null;
+          if (!fields) {
+            fields = {
+              route_id: tu.trip?.route_id ?? null,
+              trip_id:  tu.trip?.trip_id  ?? null,
+              stop_id:  stopId,
+            };
+          } else {
+            fields.route_id ??= tu.trip?.route_id ?? null;
+            fields.trip_id  ??= tu.trip?.trip_id  ?? null;
+            fields.stop_id  ??= stopId;
+          }
+          break;
         }
       }
+    }
+
+    if (fields) {
+      log(`[GTFS-RT] Matched bus ${busStr}: route=${fields.route_id}, trip=${fields.trip_id}, stop=${fields.stop_id}`);
+      return { gtfs: 'match', ...fields };
     }
 
     log(`[GTFS-RT] No match for bus ${busStr}`);
