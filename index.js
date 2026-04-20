@@ -8,6 +8,7 @@ const https = require('https');
 const http = require('http');
 const { SerialPort } = require('serialport');
 const { ReadlineParser } = require('@serialport/parser-readline');
+const GtfsRealtimeBindings = require('gtfs-realtime-bindings');
 
 // --- Configuration -----------------------------------------------------------
 
@@ -23,10 +24,13 @@ const CONFIG = {
   minCardLength: 4,
   maxCardLength: 20,
   cardCooldownMs: 2_000,    // ignore re-reads of the same card within this window
-  batchIntervalMs: 30_000,  // ms between batch send attempts
+  batchIntervalMs: 20_000,  // ms between batch send attempts
   maxQueueSize: 10_000,
   deviceScanIntervalMs: 5_000,
   heartbeatIntervalMs: 300_000,
+  gtfsRtVehiclesUrl: process.env.GTFS_RT_VEHICLES_URL || 'https://bustracker.ridewta.com/gtfsrt/vehicles',
+  gtfsRtTripsUrl:    process.env.GTFS_RT_TRIPS_URL    || 'https://bustracker.ridewta.com/gtfsrt/trips',
+  gtfsRtTtlMs:       60_000,
 };
 
 if (!CONFIG.serverUrl || !CONFIG.apiKey) {
@@ -194,6 +198,133 @@ async function fetchGps() {
   return { latitude: null, longitude: null };
 }
 
+// --- GTFS-RT Cache -----------------------------------------------------------
+
+class GtfsRtCache {
+  constructor(vehiclesUrl, tripsUrl, ttlMs) {
+    this._vehiclesUrl = vehiclesUrl;
+    this._tripsUrl    = tripsUrl;
+    this._ttlMs       = ttlMs;
+    this._vehiclesFeed  = null;
+    this._tripsFeed     = null;
+    this._lastFetchMs   = 0;
+    this._refreshPromise = null;
+  }
+
+  _fetchFeed(urlStr) {
+    return new Promise((resolve) => {
+      const url = new URL(urlStr);
+      const req = https.request({
+        hostname: url.hostname,
+        path: url.pathname + url.search,
+        method: 'GET',
+        timeout: 10_000,
+      }, (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          try {
+            const feed = GtfsRealtimeBindings.transit_realtime.FeedMessage.decode(Buffer.concat(chunks));
+            resolve({ ok: true, feed });
+          } catch (e) {
+            resolve({ ok: false, error: `Decode failed: ${e.message}` });
+          }
+        });
+      });
+      req.on('error',   (e) => resolve({ ok: false, error: e.message }));
+      req.on('timeout', ()  => { req.destroy(); resolve({ ok: false, error: 'Timed out' }); });
+      req.end();
+    });
+  }
+
+  async _refresh() {
+    log('[GTFS-RT] Fetching vehicles + trips feeds...');
+    const [vResult, tResult] = await Promise.all([
+      this._fetchFeed(this._vehiclesUrl),
+      this._fetchFeed(this._tripsUrl),
+    ]);
+    if (vResult.ok) {
+      this._vehiclesFeed = vResult.feed;
+      log(`[GTFS-RT] Vehicles: ${this._vehiclesFeed.entity.length} entities`);
+    } else {
+      log(`[GTFS-RT] WARNING - Vehicles fetch failed: ${vResult.error}`);
+    }
+    if (tResult.ok) {
+      this._tripsFeed = tResult.feed;
+      log(`[GTFS-RT] Trips: ${this._tripsFeed.entity.length} entities`);
+    } else {
+      log(`[GTFS-RT] WARNING - Trips fetch failed: ${tResult.error}`);
+    }
+    this._lastFetchMs = Date.now();
+  }
+
+  _ensureFresh() {
+    if (this._vehiclesFeed && Date.now() - this._lastFetchMs < this._ttlMs) {
+      return Promise.resolve();
+    }
+    if (!this._refreshPromise) {
+      this._refreshPromise = this._refresh().finally(() => {
+        this._refreshPromise = null;
+      });
+    }
+    return this._refreshPromise;
+  }
+
+  async getGtfsInfo(busNumber) {
+    try {
+      await this._ensureFresh();
+    } catch (e) {
+      log(`[GTFS-RT] Refresh error: ${e.message}`);
+      return { gtfs: 'no match' };
+    }
+
+    const busStr = String(busNumber);
+
+    // Try vehicles feed first — has route, trip, and current stop_id
+    if (this._vehiclesFeed?.entity) {
+      for (const entity of this._vehiclesFeed.entity) {
+        const veh = entity.vehicle;
+        if (!veh) continue;
+        if (String(veh.vehicle?.id ?? '') === busStr) {
+          log(`[GTFS-RT] Matched bus ${busStr} in vehicles feed`);
+          return {
+            gtfs:     'match',
+            route_id: veh.trip?.route_id ?? null,
+            trip_id:  veh.trip?.trip_id  ?? null,
+            stop_id:  veh.stop_id        ?? null,
+          };
+        }
+      }
+    }
+
+    // Fall back to trips feed
+    if (this._tripsFeed?.entity) {
+      for (const entity of this._tripsFeed.entity) {
+        const tu = entity.trip_update;
+        if (!tu) continue;
+        if (String(tu.vehicle?.id ?? '') === busStr) {
+          log(`[GTFS-RT] Matched bus ${busStr} in trips feed`);
+          return {
+            gtfs:     'match',
+            route_id: tu.trip?.route_id               ?? null,
+            trip_id:  tu.trip?.trip_id                ?? null,
+            stop_id:  tu.stop_time_update?.[0]?.stop_id ?? null,
+          };
+        }
+      }
+    }
+
+    log(`[GTFS-RT] No match for bus ${busStr}`);
+    return { gtfs: 'no match' };
+  }
+}
+
+const gtfsCache = new GtfsRtCache(
+  CONFIG.gtfsRtVehiclesUrl,
+  CONFIG.gtfsRtTripsUrl,
+  CONFIG.gtfsRtTtlMs,
+);
+
 // --- Card Validation & Processing --------------------------------------------
 
 function validateCardNumber(cardNumber) {
@@ -239,8 +370,12 @@ async function processCard(cardNumber, devicePath, tapQueue, busNumber) {
 
   log(`[Process] ACCEPTED - ${cardNumber} (${reason})`);
 
-  const { latitude, longitude } = await fetchGps();
+  const [{ latitude, longitude }, gtfsInfo] = await Promise.all([
+    fetchGps(),
+    gtfsCache.getGtfsInfo(busNumber),
+  ]);
   log(`[Process] GPS: lat=${latitude}, lon=${longitude}`);
+  log(`[Process] GTFS: ${JSON.stringify(gtfsInfo)}`);
 
   tapQueue.enqueue({
     card_number: cardNumber,
@@ -248,9 +383,10 @@ async function processCard(cardNumber, devicePath, tapQueue, busNumber) {
     latitude,
     longitude,
     bus_number: busNumber,
+    ...gtfsInfo,
   });
 
-  log(`[Process] Tap enqueued: card=${cardNumber}, bus=${busNumber}, gps=(${latitude},${longitude})`);
+  log(`[Process] Tap enqueued: card=${cardNumber}, bus=${busNumber}, gps=(${latitude},${longitude}), gtfs=${gtfsInfo.gtfs}`);
   return true;
 }
 
