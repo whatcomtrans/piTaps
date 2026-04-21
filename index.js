@@ -200,15 +200,29 @@ async function fetchGps() {
 
 // --- GTFS-RT Cache -----------------------------------------------------------
 
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  if (lat1 == null || lon1 == null || lat2 == null || lon2 == null) return 0;
+  const R = 6371000;
+  const toRad = (d) => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 +
+            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
 class GtfsRtCache {
-  constructor(vehiclesUrl, tripsUrl, ttlMs) {
-    this._vehiclesUrl = vehiclesUrl;
-    this._tripsUrl    = tripsUrl;
-    this._ttlMs       = ttlMs;
-    this._vehiclesFeed  = null;
-    this._tripsFeed     = null;
-    this._lastFetchMs   = 0;
-    this._refreshPromise = null;
+  constructor(vehiclesUrl, tripsUrl, ttlMs, moveThresholdM = 50) {
+    this._vehiclesUrl     = vehiclesUrl;
+    this._tripsUrl        = tripsUrl;
+    this._ttlMs           = ttlMs;
+    this._moveThresholdM  = moveThresholdM;
+    this._vehiclesFeed    = null;
+    this._tripsFeed       = null;
+    this._lastFetchMs     = 0;
+    this._lastFetchLat    = null;
+    this._lastFetchLon    = null;
+    this._refreshPromise  = null;
   }
 
   _fetchFeed(urlStr) {
@@ -237,7 +251,7 @@ class GtfsRtCache {
     });
   }
 
-  async _refresh() {
+  async _refresh(lat, lon) {
     log('[GTFS-RT] Fetching vehicles + trips feeds...');
     const [vResult, tResult] = await Promise.all([
       this._fetchFeed(this._vehiclesUrl),
@@ -255,24 +269,29 @@ class GtfsRtCache {
     } else {
       log(`[GTFS-RT] WARNING - Trips fetch failed: ${tResult.error}`);
     }
-    this._lastFetchMs = Date.now();
+    this._lastFetchMs  = Date.now();
+    this._lastFetchLat = lat;
+    this._lastFetchLon = lon;
   }
 
-  _ensureFresh() {
-    if (this._vehiclesFeed && Date.now() - this._lastFetchMs < this._ttlMs) {
-      return Promise.resolve();
+  _ensureFresh(lat, lon) {
+    if (this._vehiclesFeed) {
+      const tooOld  = Date.now() - this._lastFetchMs >= this._ttlMs;
+      const movedFar = haversineMeters(lat, lon, this._lastFetchLat, this._lastFetchLon) > this._moveThresholdM;
+      if (!tooOld && !movedFar) return Promise.resolve();
+      log(`[GTFS-RT] Cache invalidated — ${tooOld ? 'TTL expired' : `bus moved >${this._moveThresholdM}m`}`);
     }
     if (!this._refreshPromise) {
-      this._refreshPromise = this._refresh().finally(() => {
+      this._refreshPromise = this._refresh(lat, lon).finally(() => {
         this._refreshPromise = null;
       });
     }
     return this._refreshPromise;
   }
 
-  async getGtfsInfo(busNumber) {
+  async getGtfsInfo(busNumber, lat, lon) {
     try {
-      await this._ensureFresh();
+      await this._ensureFresh(lat, lon);
     } catch (e) {
       log(`[GTFS-RT] Refresh error: ${e.message}`);
       return { gtfs: 'no match' };
@@ -384,11 +403,9 @@ async function processCard(cardNumber, devicePath, tapQueue, busNumber) {
 
   log(`[Process] ACCEPTED - ${cardNumber} (${reason})`);
 
-  const [{ latitude, longitude }, gtfsInfo] = await Promise.all([
-    fetchGps(),
-    gtfsCache.getGtfsInfo(busNumber),
-  ]);
+  const { latitude, longitude } = await fetchGps();
   log(`[Process] GPS: lat=${latitude}, lon=${longitude}`);
+  const gtfsInfo = await gtfsCache.getGtfsInfo(busNumber, latitude, longitude);
   log(`[Process] GTFS: ${JSON.stringify(gtfsInfo)}`);
 
   tapQueue.enqueue({
