@@ -9,6 +9,7 @@ const http = require('http');
 const { SerialPort } = require('serialport');
 const { ReadlineParser } = require('@serialport/parser-readline');
 const GtfsRealtimeBindings = require('gtfs-realtime-bindings');
+const AdmZip = require('adm-zip');
 
 // --- Configuration -----------------------------------------------------------
 
@@ -30,7 +31,8 @@ const CONFIG = {
   heartbeatIntervalMs: 300_000,
   gtfsRtVehiclesUrl: process.env.GTFS_RT_VEHICLES_URL || 'https://bustracker.ridewta.com/gtfsrt/vehicles',
   gtfsRtTripsUrl:    process.env.GTFS_RT_TRIPS_URL    || 'https://bustracker.ridewta.com/gtfsrt/trips',
-  gtfsRtTtlMs:       60_000,
+  gtfsRtTtlMs:       30_000,
+  gtfsStaticUrl:     process.env.GTFS_STATIC_URL      || 'https://github.com/whatcomtrans/publicwtadata/raw/master/GTFS/wta_gtfs_latest.zip',
 };
 
 if (!CONFIG.serverUrl || !CONFIG.apiKey) {
@@ -198,31 +200,121 @@ async function fetchGps() {
   return { latitude: null, longitude: null };
 }
 
-// --- GTFS-RT Cache -----------------------------------------------------------
+// --- GTFS Static Cache -------------------------------------------------------
 
-function haversineMeters(lat1, lon1, lat2, lon2) {
-  if (lat1 == null || lon1 == null || lat2 == null || lon2 == null) return 0;
-  const R = 6371000;
-  const toRad = (d) => d * Math.PI / 180;
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const a = Math.sin(dLat / 2) ** 2 +
-            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+class GtfsStaticCache {
+  constructor(staticUrl) {
+    this._staticUrl   = staticUrl;
+    this._stopTimes   = new Map(); // trip_id → [{stopSequence, stopId}] sorted by sequence
+    this._loaded      = false;
+    this._loadPromise = null;
+  }
+
+  // Returns sorted stop array for a trip, or null if not yet loaded / not found.
+  getStops(tripId) {
+    if (!this._loaded || tripId == null) return null;
+    return this._stopTimes.get(String(tripId)) ?? null;
+  }
+
+  // Kicks off the download+parse if not already started. Safe to call multiple times.
+  ensureLoaded() {
+    if (this._loaded) return Promise.resolve();
+    if (!this._loadPromise) {
+      this._loadPromise = this._downloadAndParse()
+        .then(() => { this._loaded = true; })
+        .catch((e) => {
+          log(`[GTFS-Static] Load failed: ${e.message}`);
+          this._loadPromise = null; // allow a later retry
+        });
+    }
+    return this._loadPromise;
+  }
+
+  _downloadZip(urlStr, redirectsLeft = 5) {
+    return new Promise((resolve, reject) => {
+      if (redirectsLeft <= 0) return reject(new Error('Too many redirects'));
+      const url = new URL(urlStr);
+      const lib = url.protocol === 'https:' ? https : http;
+      const chunks = [];
+      const req = lib.request({
+        hostname: url.hostname,
+        path:     url.pathname + url.search,
+        method:   'GET',
+        headers:  { 'User-Agent': 'piTaps/1.0' },
+        timeout:  120_000,
+      }, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          res.resume();
+          resolve(this._downloadZip(res.headers.location, redirectsLeft - 1));
+          return;
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          return reject(new Error(`HTTP ${res.statusCode}`));
+        }
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => resolve(Buffer.concat(chunks)));
+      });
+      req.on('error', reject);
+      req.on('timeout', () => { req.destroy(); reject(new Error('Download timed out')); });
+      req.end();
+    });
+  }
+
+  async _downloadAndParse() {
+    log(`[GTFS-Static] Downloading from ${this._staticUrl}...`);
+    const buffer = await this._downloadZip(this._staticUrl);
+    log(`[GTFS-Static] Downloaded ${(buffer.length / 1024 / 1024).toFixed(1)} MB — parsing stop_times...`);
+
+    const zip   = new AdmZip(buffer);
+    const entry = zip.getEntry('stop_times.txt');
+    if (!entry) throw new Error('stop_times.txt not found in GTFS ZIP');
+
+    const csv     = entry.getData().toString('utf8');
+    const lines   = csv.split('\n');
+    const headers = lines[0].toLowerCase().replace(/\r/g, '').split(',').map((h) => h.trim());
+
+    const tripIdIdx = headers.indexOf('trip_id');
+    const stopIdIdx  = headers.indexOf('stop_id');
+    const stopSeqIdx = headers.indexOf('stop_sequence');
+    if (tripIdIdx < 0 || stopIdIdx < 0 || stopSeqIdx < 0) {
+      throw new Error('stop_times.txt missing required columns');
+    }
+
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      const cols   = line.split(',');
+      const tripId = cols[tripIdIdx]?.trim();
+      const stopId = cols[stopIdIdx]?.trim();
+      const seq    = parseInt(cols[stopSeqIdx]?.trim(), 10);
+      if (!tripId || !stopId || isNaN(seq)) continue;
+      if (!this._stopTimes.has(tripId)) this._stopTimes.set(tripId, []);
+      this._stopTimes.get(tripId).push({ stopSequence: seq, stopId });
+    }
+
+    for (const stops of this._stopTimes.values()) {
+      stops.sort((a, b) => a.stopSequence - b.stopSequence);
+    }
+
+    log(`[GTFS-Static] Loaded ${this._stopTimes.size} trips`);
+  }
 }
 
+// --- GTFS-RT Cache -----------------------------------------------------------
+
 class GtfsRtCache {
-  constructor(vehiclesUrl, tripsUrl, ttlMs, moveThresholdM = 50) {
-    this._vehiclesUrl     = vehiclesUrl;
-    this._tripsUrl        = tripsUrl;
-    this._ttlMs           = ttlMs;
-    this._moveThresholdM  = moveThresholdM;
-    this._vehiclesFeed    = null;
-    this._tripsFeed       = null;
-    this._lastFetchMs     = 0;
-    this._lastFetchLat    = null;
-    this._lastFetchLon    = null;
-    this._refreshPromise  = null;
+  constructor(vehiclesUrl, tripsUrl, ttlMs, staticCache) {
+    this._vehiclesUrl    = vehiclesUrl;
+    this._tripsUrl       = tripsUrl;
+    this._ttlMs          = ttlMs;
+    this._staticCache    = staticCache;
+    this._vehiclesFeed   = null;
+    this._tripsFeed      = null;
+    this._lastFetchMs    = 0;
+    this._refreshPromise = null;
+    this._currentTripId  = null;
+    this._previousTripId = null;
   }
 
   _fetchFeed(urlStr) {
@@ -251,7 +343,7 @@ class GtfsRtCache {
     });
   }
 
-  async _refresh(lat, lon) {
+  async _refresh() {
     log('[GTFS-RT] Fetching vehicles + trips feeds...');
     const [vResult, tResult] = await Promise.all([
       this._fetchFeed(this._vehiclesUrl),
@@ -269,29 +361,63 @@ class GtfsRtCache {
     } else {
       log(`[GTFS-RT] WARNING - Trips fetch failed: ${tResult.error}`);
     }
-    this._lastFetchMs  = Date.now();
-    this._lastFetchLat = lat;
-    this._lastFetchLon = lon;
+    this._lastFetchMs = Date.now();
   }
 
-  _ensureFresh(lat, lon) {
-    if (this._vehiclesFeed) {
-      const tooOld  = Date.now() - this._lastFetchMs >= this._ttlMs;
-      const movedFar = haversineMeters(lat, lon, this._lastFetchLat, this._lastFetchLon) > this._moveThresholdM;
-      if (!tooOld && !movedFar) return Promise.resolve();
-      log(`[GTFS-RT] Cache invalidated — ${tooOld ? 'TTL expired' : `bus moved >${this._moveThresholdM}m`}`);
+  _ensureFresh() {
+    if (this._vehiclesFeed && Date.now() - this._lastFetchMs < this._ttlMs) {
+      return Promise.resolve();
     }
     if (!this._refreshPromise) {
-      this._refreshPromise = this._refresh(lat, lon).finally(() => {
+      this._refreshPromise = this._refresh().finally(() => {
         this._refreshPromise = null;
       });
     }
     return this._refreshPromise;
   }
 
-  async getGtfsInfo(busNumber, lat, lon) {
+  // Track trip changes and keep previous trip for boundary lookups.
+  _trackTripId(tripId) {
+    if (!tripId || tripId === this._currentTripId) return;
+    log(`[GTFS-RT] Trip changed: ${this._currentTripId ?? 'none'} → ${tripId}`);
+    this._previousTripId = this._currentTripId;
+    this._currentTripId  = tripId;
+  }
+
+  // Given that the bus is IN_TRANSIT_TO stop at sequence N, find the stop at N-1.
+  // Searches current trip first, then falls back to the last stop of the previous trip
+  // to handle the trip-boundary case (bus just finished trip A, started trip B).
+  _resolveInTransitStop(inTransitToSeq) {
+    const prevSeq = inTransitToSeq - 1;
+
+    const currentStops = this._staticCache.getStops(this._currentTripId);
+    if (currentStops) {
+      const stop = currentStops.find((s) => s.stopSequence === prevSeq);
+      if (stop) {
+        log(`[GTFS-RT] IN_TRANSIT_TO seq ${inTransitToSeq}: found seq ${prevSeq} in current trip → stop ${stop.stopId}`);
+        return stop.stopId;
+      }
+    }
+
+    // Not in current trip — use the last stop of the previous trip (trip boundary)
+    const prevStops = this._staticCache.getStops(this._previousTripId);
+    if (prevStops?.length > 0) {
+      const lastStop = prevStops[prevStops.length - 1];
+      log(`[GTFS-RT] IN_TRANSIT_TO seq ${inTransitToSeq}: seq ${prevSeq} not in current trip, using last stop of previous trip → ${lastStop.stopId}`);
+      return lastStop.stopId;
+    }
+
+    if (!this._staticCache._loaded) {
+      log(`[GTFS-RT] IN_TRANSIT_TO seq ${inTransitToSeq}: static data not yet loaded`);
+    } else {
+      log(`[GTFS-RT] IN_TRANSIT_TO seq ${inTransitToSeq}: previous stop not found in static data`);
+    }
+    return null;
+  }
+
+  async getGtfsInfo(busNumber) {
     try {
-      await this._ensureFresh(lat, lon);
+      await this._ensureFresh();
     } catch (e) {
       log(`[GTFS-RT] Refresh error: ${e.message}`);
       return { gtfs: 'no match' };
@@ -299,18 +425,26 @@ class GtfsRtCache {
 
     const busStr = String(busNumber);
     let fields = null;
+    let inTransitToSeq = null; // next stop's sequence number when IN_TRANSIT_TO
 
-    // Try vehicles feed first — has route, trip, and current stop_id
+    // Try vehicles feed first — has route, trip, and current stop status
     if (this._vehiclesFeed?.entity) {
       for (const entity of this._vehiclesFeed.entity) {
         const veh = entity.vehicle;
         if (!veh) continue;
         if (String(veh.vehicle?.id ?? '') === busStr) {
           log(`[GTFS-RT] Found bus ${busStr} in vehicles feed`);
+          // currentStatus: 0=INCOMING_AT, 1=STOPPED_AT, 2=IN_TRANSIT_TO
+          const isInTransit = veh.currentStatus === 2;
+          if (isInTransit && veh.currentStopSequence != null) {
+            inTransitToSeq = veh.currentStopSequence;
+          }
+          const tripId = veh.trip?.tripId ?? null;
+          this._trackTripId(tripId);
           fields = {
-            route_id: veh.trip?.routeId  ?? null,
-            trip_id:  veh.trip?.tripId   ?? null,
-            stop_id:  veh.stopId         ?? null,
+            route_id: veh.trip?.routeId ?? null,
+            trip_id:  tripId,
+            stop_id:  isInTransit ? null : (veh.stopId ?? null),
           };
           break;
         }
@@ -325,21 +459,30 @@ class GtfsRtCache {
         if (!tu) continue;
         if (String(tu.vehicle?.id ?? '') === busStr) {
           log(`[GTFS-RT] Found bus ${busStr} in trips feed`);
-          const stopId = tu.stopTimeUpdate?.[0]?.stopId ?? null;
+          const tripId = tu.trip?.tripId ?? null;
+          this._trackTripId(tripId);
+          const stopId = inTransitToSeq != null
+            ? null  // resolved below from static data
+            : (tu.stopTimeUpdate?.[0]?.stopId ?? null);
           if (!fields) {
             fields = {
               route_id: tu.trip?.routeId ?? null,
-              trip_id:  tu.trip?.tripId  ?? null,
+              trip_id:  tripId,
               stop_id:  stopId,
             };
           } else {
             fields.route_id ??= tu.trip?.routeId ?? null;
-            fields.trip_id  ??= tu.trip?.tripId  ?? null;
+            fields.trip_id  ??= tripId;
             fields.stop_id  ??= stopId;
           }
           break;
         }
       }
+    }
+
+    // Resolve IN_TRANSIT_TO stop from static data (works across trip boundaries)
+    if (inTransitToSeq != null && fields && fields.stop_id == null) {
+      fields.stop_id = this._resolveInTransitStop(inTransitToSeq);
     }
 
     if (fields) {
@@ -352,10 +495,12 @@ class GtfsRtCache {
   }
 }
 
+const gtfsStaticCache = new GtfsStaticCache(CONFIG.gtfsStaticUrl);
 const gtfsCache = new GtfsRtCache(
   CONFIG.gtfsRtVehiclesUrl,
   CONFIG.gtfsRtTripsUrl,
   CONFIG.gtfsRtTtlMs,
+  gtfsStaticCache,
 );
 
 // --- Card Validation & Processing --------------------------------------------
@@ -403,9 +548,11 @@ async function processCard(cardNumber, devicePath, tapQueue, busNumber) {
 
   log(`[Process] ACCEPTED - ${cardNumber} (${reason})`);
 
-  const { latitude, longitude } = await fetchGps();
+  const [{ latitude, longitude }, gtfsInfo] = await Promise.all([
+    fetchGps(),
+    gtfsCache.getGtfsInfo(busNumber),
+  ]);
   log(`[Process] GPS: lat=${latitude}, lon=${longitude}`);
-  const gtfsInfo = await gtfsCache.getGtfsInfo(busNumber, latitude, longitude);
   log(`[Process] GTFS: ${JSON.stringify(gtfsInfo)}`);
 
   tapQueue.enqueue({
@@ -675,6 +822,9 @@ class DeviceMonitor {
 async function main() {
   log('=== piTaps App Starting ===');
   log(`Config: server=${CONFIG.serverUrl}, baud=${CONFIG.serialBaud}, batch_interval=${CONFIG.batchIntervalMs / 1000}s`);
+
+  // Start static GTFS download in the background — will be ready before the first trip boundary is hit.
+  gtfsStaticCache.ensureLoaded();
 
   const busNumber = await fetchVehicleId();
 
