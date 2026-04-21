@@ -29,10 +29,11 @@ const CONFIG = {
   maxQueueSize: 10_000,
   deviceScanIntervalMs: 5_000,
   heartbeatIntervalMs: 300_000,
-  gtfsRtVehiclesUrl: process.env.GTFS_RT_VEHICLES_URL || 'https://bustracker.ridewta.com/gtfsrt/vehicles',
-  gtfsRtTripsUrl:    process.env.GTFS_RT_TRIPS_URL    || 'https://bustracker.ridewta.com/gtfsrt/trips',
-  gtfsRtTtlMs:       30_000,
-  gtfsStaticUrl:     process.env.GTFS_STATIC_URL      || 'https://github.com/whatcomtrans/publicwtadata/raw/master/GTFS/wta_gtfs_latest.zip',
+  gtfsRtVehiclesUrl:   process.env.GTFS_RT_VEHICLES_URL || 'https://bustracker.ridewta.com/gtfsrt/vehicles',
+  gtfsRtTripsUrl:      process.env.GTFS_RT_TRIPS_URL    || 'https://bustracker.ridewta.com/gtfsrt/trips',
+  gtfsRtPollIntervalMs: 30_000,   // how often to poll GTFS-RT and update current stop
+  stopProximityMeters:  150,      // GPS distance threshold for stop validation
+  gtfsStaticUrl:       process.env.GTFS_STATIC_URL      || 'https://github.com/whatcomtrans/publicwtadata/raw/master/GTFS/wta_gtfs_latest.zip',
 };
 
 if (!CONFIG.serverUrl || !CONFIG.apiKey) {
@@ -200,20 +201,40 @@ async function fetchGps() {
   return { latitude: null, longitude: null };
 }
 
+// --- Haversine distance ------------------------------------------------------
+
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  const R     = 6_371_000; // Earth radius in metres
+  const toRad = (deg) => deg * Math.PI / 180;
+  const dLat  = toRad(lat2 - lat1);
+  const dLon  = toRad(lon2 - lon1);
+  const a     = Math.sin(dLat / 2) ** 2
+    + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.asin(Math.sqrt(a));
+}
+
 // --- GTFS Static Cache -------------------------------------------------------
 
 class GtfsStaticCache {
   constructor(staticUrl) {
     this._staticUrl   = staticUrl;
-    this._stopTimes   = new Map(); // trip_id → [{stopSequence, stopId}] sorted by sequence
+    this._stopTimes   = new Map(); // trip_id → [{stopSequence, stopId, lat, lon}] sorted by sequence
+    this._stops       = new Map(); // stop_id → {lat, lon}
+    this._trips       = new Map(); // trip_id → {route_id, service_id}
     this._loaded      = false;
     this._loadPromise = null;
   }
 
-  // Returns sorted stop array for a trip, or null if not yet loaded / not found.
+  // Returns sorted stop array for a trip (with lat/lon), or null if not yet loaded / not found.
   getStops(tripId) {
     if (!this._loaded || tripId == null) return null;
     return this._stopTimes.get(String(tripId)) ?? null;
+  }
+
+  // Returns {route_id, service_id} for a trip, or null if not loaded / not found.
+  getTripInfo(tripId) {
+    if (!this._loaded || tripId == null) return null;
+    return this._trips.get(String(tripId)) ?? null;
   }
 
   // Kicks off the download+parse if not already started. Safe to call multiple times.
@@ -264,9 +285,69 @@ class GtfsStaticCache {
   async _downloadAndParse() {
     log(`[GTFS-Static] Downloading from ${this._staticUrl}...`);
     const buffer = await this._downloadZip(this._staticUrl);
-    log(`[GTFS-Static] Downloaded ${(buffer.length / 1024 / 1024).toFixed(1)} MB — parsing stop_times...`);
+    log(`[GTFS-Static] Downloaded ${(buffer.length / 1024 / 1024).toFixed(1)} MB — parsing stops + stop_times...`);
 
-    const zip   = new AdmZip(buffer);
+    const zip = new AdmZip(buffer);
+
+    // --- Parse stops.txt → stop coordinates ---
+    const stopsEntry = zip.getEntry('stops.txt');
+    if (stopsEntry) {
+      const csv     = stopsEntry.getData().toString('utf8');
+      const lines   = csv.split('\n');
+      const headers = lines[0].toLowerCase().replace(/\r/g, '').split(',').map((h) => h.trim());
+      const idIdx   = headers.indexOf('stop_id');
+      const latIdx  = headers.indexOf('stop_lat');
+      const lonIdx  = headers.indexOf('stop_lon');
+      if (idIdx >= 0 && latIdx >= 0 && lonIdx >= 0) {
+        for (let i = 1; i < lines.length; i++) {
+          const line = lines[i].trim();
+          if (!line) continue;
+          const cols   = line.split(',');
+          const stopId = cols[idIdx]?.trim();
+          const lat    = parseFloat(cols[latIdx]?.trim());
+          const lon    = parseFloat(cols[lonIdx]?.trim());
+          if (stopId && !isNaN(lat) && !isNaN(lon)) {
+            this._stops.set(stopId, { lat, lon });
+          }
+        }
+        log(`[GTFS-Static] Loaded ${this._stops.size} stop coordinates`);
+      } else {
+        log('[GTFS-Static] WARNING - stops.txt missing stop_id/stop_lat/stop_lon columns');
+      }
+    } else {
+      log('[GTFS-Static] WARNING - stops.txt not found in ZIP');
+    }
+
+    // --- Parse trips.txt → trip metadata (route_id, service_id) ---
+    const tripsEntry = zip.getEntry('trips.txt');
+    if (tripsEntry) {
+      const csv     = tripsEntry.getData().toString('utf8');
+      const lines   = csv.split('\n');
+      const headers = lines[0].toLowerCase().replace(/\r/g, '').split(',').map((h) => h.trim());
+      const tIdIdx  = headers.indexOf('trip_id');
+      const rIdIdx  = headers.indexOf('route_id');
+      const sIdIdx  = headers.indexOf('service_id');
+      if (tIdIdx >= 0 && rIdIdx >= 0 && sIdIdx >= 0) {
+        for (let i = 1; i < lines.length; i++) {
+          const line = lines[i].trim();
+          if (!line) continue;
+          const cols      = line.split(',');
+          const tripId    = cols[tIdIdx]?.trim();
+          const routeId   = cols[rIdIdx]?.trim();
+          const serviceId = cols[sIdIdx]?.trim();
+          if (tripId && routeId) {
+            this._trips.set(tripId, { route_id: routeId, service_id: serviceId || null });
+          }
+        }
+        log(`[GTFS-Static] Loaded ${this._trips.size} trip records`);
+      } else {
+        log('[GTFS-Static] WARNING - trips.txt missing required columns');
+      }
+    } else {
+      log('[GTFS-Static] WARNING - trips.txt not found in ZIP');
+    }
+
+    // --- Parse stop_times.txt → trip stop sequences (enriched with coords) ---
     const entry = zip.getEntry('stop_times.txt');
     if (!entry) throw new Error('stop_times.txt not found in GTFS ZIP');
 
@@ -274,7 +355,7 @@ class GtfsStaticCache {
     const lines   = csv.split('\n');
     const headers = lines[0].toLowerCase().replace(/\r/g, '').split(',').map((h) => h.trim());
 
-    const tripIdIdx = headers.indexOf('trip_id');
+    const tripIdIdx  = headers.indexOf('trip_id');
     const stopIdIdx  = headers.indexOf('stop_id');
     const stopSeqIdx = headers.indexOf('stop_sequence');
     if (tripIdIdx < 0 || stopIdIdx < 0 || stopSeqIdx < 0) {
@@ -290,31 +371,53 @@ class GtfsStaticCache {
       const seq    = parseInt(cols[stopSeqIdx]?.trim(), 10);
       if (!tripId || !stopId || isNaN(seq)) continue;
       if (!this._stopTimes.has(tripId)) this._stopTimes.set(tripId, []);
-      this._stopTimes.get(tripId).push({ stopSequence: seq, stopId });
+      const coords = this._stops.get(stopId) ?? { lat: null, lon: null };
+      this._stopTimes.get(tripId).push({ stopSequence: seq, stopId, lat: coords.lat, lon: coords.lon });
     }
 
     for (const stops of this._stopTimes.values()) {
       stops.sort((a, b) => a.stopSequence - b.stopSequence);
     }
 
-    log(`[GTFS-Static] Loaded ${this._stopTimes.size} trips`);
+    log(`[GTFS-Static] Loaded ${this._stopTimes.size} trips with stop sequences`);
   }
 }
 
 // --- GTFS-RT Cache -----------------------------------------------------------
 
 class GtfsRtCache {
-  constructor(vehiclesUrl, tripsUrl, ttlMs, staticCache) {
+  constructor(vehiclesUrl, tripsUrl, pollIntervalMs, staticCache) {
     this._vehiclesUrl    = vehiclesUrl;
     this._tripsUrl       = tripsUrl;
-    this._ttlMs          = ttlMs;
+    this._pollIntervalMs = pollIntervalMs;
     this._staticCache    = staticCache;
     this._vehiclesFeed   = null;
     this._tripsFeed      = null;
-    this._lastFetchMs    = 0;
-    this._refreshPromise = null;
-    this._currentTripId  = null;
-    this._previousTripId = null;
+    this._busNumber      = null;
+    this._pollTimer      = null;
+    this._polling        = false;
+    // Continuously updated vehicle state (trip/route/service from static GTFS, stop from resolution logic)
+    this._state = { tripId: null, routeId: null, serviceId: null, stopId: null, lat: null, lon: null, updatedAt: null };
+    // Enriched stop arrays for the current and previous trip (from static GTFS + stop coords)
+    this._gtfsRtTripId      = null; // most recent trip ID as reported by GTFS-RT (for change detection)
+    this._currentTripStops  = null; // [{stopSequence, stopId, lat, lon}]
+    this._previousTripId    = null;
+    this._previousTripStops = null;
+  }
+
+  // Start proactive polling. Fires immediately, then every pollIntervalMs.
+  startPolling(busNumber) {
+    this._busNumber = String(busNumber);
+    log(`[GTFS-RT] Starting poll every ${this._pollIntervalMs / 1000}s for bus ${this._busNumber}`);
+    this._poll();
+    this._pollTimer = setInterval(() => this._poll(), this._pollIntervalMs);
+  }
+
+  stopPolling() {
+    if (this._pollTimer) {
+      clearInterval(this._pollTimer);
+      this._pollTimer = null;
+    }
   }
 
   _fetchFeed(urlStr) {
@@ -361,137 +464,172 @@ class GtfsRtCache {
     } else {
       log(`[GTFS-RT] WARNING - Trips fetch failed: ${tResult.error}`);
     }
-    this._lastFetchMs = Date.now();
   }
 
-  _ensureFresh() {
-    if (this._vehiclesFeed && Date.now() - this._lastFetchMs < this._ttlMs) {
-      return Promise.resolve();
-    }
-    if (!this._refreshPromise) {
-      this._refreshPromise = this._refresh().finally(() => {
-        this._refreshPromise = null;
-      });
-    }
-    return this._refreshPromise;
-  }
-
-  // Track trip changes and keep previous trip for boundary lookups.
-  _trackTripId(tripId) {
-    if (!tripId || tripId === this._currentTripId) return;
-    log(`[GTFS-RT] Trip changed: ${this._currentTripId ?? 'none'} → ${tripId}`);
-    this._previousTripId = this._currentTripId;
-    this._currentTripId  = tripId;
-  }
-
-  // Given that the bus is IN_TRANSIT_TO stop at sequence N, find the stop at N-1.
-  // Searches current trip first, then falls back to the last stop of the previous trip
-  // to handle the trip-boundary case (bus just finished trip A, started trip B).
-  _resolveInTransitStop(inTransitToSeq) {
-    const prevSeq = inTransitToSeq - 1;
-
-    const currentStops = this._staticCache.getStops(this._currentTripId);
-    if (currentStops) {
-      const stop = currentStops.find((s) => s.stopSequence === prevSeq);
-      if (stop) {
-        log(`[GTFS-RT] IN_TRANSIT_TO seq ${inTransitToSeq}: found seq ${prevSeq} in current trip → stop ${stop.stopId}`);
-        return stop.stopId;
-      }
-    }
-
-    // Not in current trip — use the last stop of the previous trip (trip boundary)
-    const prevStops = this._staticCache.getStops(this._previousTripId);
-    if (prevStops?.length > 0) {
-      const lastStop = prevStops[prevStops.length - 1];
-      log(`[GTFS-RT] IN_TRANSIT_TO seq ${inTransitToSeq}: seq ${prevSeq} not in current trip, using last stop of previous trip → ${lastStop.stopId}`);
-      return lastStop.stopId;
-    }
-
-    if (!this._staticCache._loaded) {
-      log(`[GTFS-RT] IN_TRANSIT_TO seq ${inTransitToSeq}: static data not yet loaded`);
-    } else {
-      log(`[GTFS-RT] IN_TRANSIT_TO seq ${inTransitToSeq}: previous stop not found in static data`);
-    }
-    return null;
-  }
-
-  async getGtfsInfo(busNumber) {
+  async _poll() {
+    if (this._polling) return;
+    this._polling = true;
     try {
-      await this._ensureFresh();
+      const [gps] = await Promise.all([fetchGps(), this._refresh()]);
+
+      const busStr = this._busNumber;
+      let rtTripId = null, rtRouteId = null, currentStopSeq = null, currentStatus = null;
+
+      // Try vehicles feed first — has route, trip, and current stop sequence/status
+      if (this._vehiclesFeed?.entity) {
+        for (const entity of this._vehiclesFeed.entity) {
+          const veh = entity.vehicle;
+          if (!veh) continue;
+          if (String(veh.vehicle?.id ?? '') === busStr) {
+            rtTripId       = veh.trip?.tripId  ?? null;
+            rtRouteId      = veh.trip?.routeId ?? null;
+            currentStopSeq = veh.currentStopSequence ?? null;
+            currentStatus  = veh.currentStatus ?? null; // 0=INCOMING_AT, 1=STOPPED_AT, 2=IN_TRANSIT_TO
+            break;
+          }
+        }
+      }
+
+      // Fall back to trips feed if trip not found in vehicles
+      if (!rtTripId && this._tripsFeed?.entity) {
+        for (const entity of this._tripsFeed.entity) {
+          const tu = entity.tripUpdate;
+          if (!tu) continue;
+          if (String(tu.vehicle?.id ?? '') === busStr) {
+            rtTripId  = tu.trip?.tripId  ?? null;
+            rtRouteId = tu.trip?.routeId ?? null;
+            break;
+          }
+        }
+      }
+
+      // Track GTFS-RT trip changes — rebuild enriched stop list for new trip
+      if (rtTripId && rtTripId !== this._gtfsRtTripId) {
+        log(`[GTFS-RT] Trip changed: ${this._gtfsRtTripId ?? 'none'} → ${rtTripId}`);
+        this._previousTripId    = this._gtfsRtTripId;
+        this._previousTripStops = this._currentTripStops;
+        this._currentTripStops  = this._staticCache.getStops(rtTripId);
+        this._gtfsRtTripId      = rtTripId;
+        if (!this._currentTripStops) {
+          log(`[GTFS-RT] Static stop data not yet available for trip ${rtTripId}`);
+        }
+      } else if (rtTripId && !this._currentTripStops) {
+        // Static data may have loaded since the last poll — retry
+        this._currentTripStops = this._staticCache.getStops(rtTripId);
+      }
+
+      // Determine which stop the bus is at and which trip that stop belongs to.
+      // At trip boundaries these may differ from rtTripId (see _resolveStop).
+      let stopId = null;
+      let resolvedTripId = rtTripId; // the trip the resolved stop belongs to
+      if (currentStopSeq != null && currentStatus != null) {
+        const resolved = this._resolveStop(currentStopSeq, currentStatus, gps.latitude, gps.longitude, rtTripId);
+        if (resolved) {
+          stopId         = resolved.stopId;
+          resolvedTripId = resolved.sourceTripId;
+        }
+      } else if (this._currentTripStops) {
+        // No sequence data from GTFS-RT — use GPS alone to find nearest stop on the trip
+        const nearest = this._findNearestStop(this._currentTripStops, gps.latitude, gps.longitude);
+        if (nearest) {
+          stopId = nearest.stopId;
+          log(`[GTFS-RT] No sequence data — GPS nearest stop: ${stopId} (${nearest.distance.toFixed(0)}m)`);
+        }
+      }
+
+      // resolvedTripId may be null if bus not in feeds — retain previous
+      resolvedTripId = resolvedTripId ?? this._state.tripId;
+
+      // Look up authoritative route_id and service_id from static trips data
+      const tripInfo = this._staticCache.getTripInfo(resolvedTripId);
+      const routeId   = tripInfo?.route_id   ?? rtRouteId ?? this._state.routeId;
+      const serviceId = tripInfo?.service_id ?? this._state.serviceId;
+
+      this._state = {
+        tripId:    resolvedTripId,
+        routeId,
+        serviceId,
+        stopId,
+        lat:       gps.latitude,
+        lon:       gps.longitude,
+        updatedAt: Date.now(),
+      };
+
+      if (rtTripId) {
+        log(`[GTFS-RT] Poll: bus=${busStr}, trip=${resolvedTripId}, route=${routeId}, service=${serviceId}, stop=${stopId}, gps=(${gps.latitude},${gps.longitude})`);
+      } else {
+        log(`[GTFS-RT] Poll: bus ${busStr} not found in feeds — retaining previous trip ${this._state.tripId ?? 'none'}`);
+      }
     } catch (e) {
-      log(`[GTFS-RT] Refresh error: ${e.message}`);
-      return { gtfs: 'no match' };
+      log(`[GTFS-RT] Poll error: ${e.message}`);
+    } finally {
+      this._polling = false;
     }
+  }
 
-    const busStr = String(busNumber);
-    let fields = null;
-    let inTransitToSeq = null; // next stop's sequence number when IN_TRANSIT_TO
+  // Determine the stop the bus is at or about to arrive at.
+  // currentStatus: 0=INCOMING_AT, 1=STOPPED_AT, 2=IN_TRANSIT_TO
+  // STOPPED_AT (1)    → use this stop (bus is here)
+  // INCOMING_AT (0)   → use this stop (bus is arriving — passengers are boarding for this trip/stop)
+  // IN_TRANSIT_TO (2) → use previous stop (seq - 1), bus has already departed it
+  //   IN_TRANSIT_TO seq 1 → targetSeq 0 won't exist → use last stop of previous trip
+  // Returns {stopId, sourceTripId} — sourceTripId may be the previous trip at boundaries.
+  _resolveStop(currentStopSeq, currentStatus, lat, lon, currentTripId) {
+    // IN_TRANSIT_TO: bus has left seq-1 and is heading to seq → use seq-1
+    // STOPPED_AT / INCOMING_AT: bus is at or arriving at this stop → use seq
+    const targetSeq = currentStatus === 2 ? currentStopSeq - 1 : currentStopSeq;
 
-    // Try vehicles feed first — has route, trip, and current stop status
-    if (this._vehiclesFeed?.entity) {
-      for (const entity of this._vehiclesFeed.entity) {
-        const veh = entity.vehicle;
-        if (!veh) continue;
-        if (String(veh.vehicle?.id ?? '') === busStr) {
-          log(`[GTFS-RT] Found bus ${busStr} in vehicles feed`);
-          // currentStatus: 0=INCOMING_AT, 1=STOPPED_AT, 2=IN_TRANSIT_TO
-          const isInTransit = veh.currentStatus === 2;
-          if (isInTransit && veh.currentStopSequence != null) {
-            inTransitToSeq = veh.currentStopSequence;
-          }
-          const tripId = veh.trip?.tripId ?? null;
-          this._trackTripId(tripId);
-          fields = {
-            route_id: veh.trip?.routeId ?? null,
-            trip_id:  tripId,
-            stop_id:  isInTransit ? null : (veh.stopId ?? null),
-          };
-          break;
-        }
+    let stop        = this._currentTripStops?.find((s) => s.stopSequence === targetSeq) ?? null;
+    let sourceTripId = currentTripId;
+
+    // Trip boundary: IN_TRANSIT_TO seq 1 gives targetSeq 0 which won't exist — use last stop of previous trip
+    if (!stop && this._previousTripStops?.length > 0) {
+      const firstSeq = this._currentTripStops?.[0]?.stopSequence ?? Infinity;
+      if (targetSeq < firstSeq) {
+        stop         = this._previousTripStops[this._previousTripStops.length - 1];
+        sourceTripId = this._previousTripId;
+        log(`[GTFS-RT] Trip boundary: using last stop of previous trip → ${stop.stopId}`);
       }
     }
 
-    // Try trips feed if any fields are still null (or bus wasn't in vehicles feed)
-    const needsTrips = !fields || fields.route_id === null || fields.trip_id === null || fields.stop_id === null;
-    if (needsTrips && this._tripsFeed?.entity) {
-      for (const entity of this._tripsFeed.entity) {
-        const tu = entity.tripUpdate;
-        if (!tu) continue;
-        if (String(tu.vehicle?.id ?? '') === busStr) {
-          log(`[GTFS-RT] Found bus ${busStr} in trips feed`);
-          const tripId = tu.trip?.tripId ?? null;
-          this._trackTripId(tripId);
-          const stopId = inTransitToSeq != null
-            ? null  // resolved below from static data
-            : (tu.stopTimeUpdate?.[0]?.stopId ?? null);
-          if (!fields) {
-            fields = {
-              route_id: tu.trip?.routeId ?? null,
-              trip_id:  tripId,
-              stop_id:  stopId,
-            };
-          } else {
-            fields.route_id ??= tu.trip?.routeId ?? null;
-            fields.trip_id  ??= tripId;
-            fields.stop_id  ??= stopId;
-          }
-          break;
+    if (!stop) return null;
+
+    // GPS validation: if we have coordinates for both the stop and the bus, verify proximity
+    if (stop.lat != null && lat != null) {
+      const dist = haversineMeters(lat, lon, stop.lat, stop.lon);
+      if (dist > CONFIG.stopProximityMeters) {
+        log(`[GTFS-RT] GTFS-RT stop ${stop.stopId} is ${dist.toFixed(0)}m away — checking GPS for override`);
+        const nearest = this._findNearestStop(this._currentTripStops, lat, lon);
+        if (nearest && nearest.distance < CONFIG.stopProximityMeters) {
+          log(`[GTFS-RT] GPS override: ${nearest.stopId} (${nearest.distance.toFixed(0)}m) instead of ${stop.stopId} (${dist.toFixed(0)}m)`);
+          return { stopId: nearest.stopId, sourceTripId: currentTripId };
         }
+        log(`[GTFS-RT] No nearby stop found via GPS — keeping GTFS-RT stop ${stop.stopId}`);
       }
     }
 
-    // Resolve IN_TRANSIT_TO stop from static data (works across trip boundaries)
-    if (inTransitToSeq != null && fields && fields.stop_id == null) {
-      fields.stop_id = this._resolveInTransitStop(inTransitToSeq);
-    }
+    return { stopId: stop.stopId, sourceTripId };
+  }
 
-    if (fields) {
-      log(`[GTFS-RT] Matched bus ${busStr}: route=${fields.route_id}, trip=${fields.trip_id}, stop=${fields.stop_id}`);
-      return { gtfs: 'match', ...fields };
+  // Find the stop on a trip closest to the given GPS coordinates.
+  _findNearestStop(tripStops, lat, lon) {
+    if (!tripStops?.length || lat == null || lon == null) return null;
+    let best = null;
+    for (const stop of tripStops) {
+      if (stop.lat == null) continue;
+      const dist = haversineMeters(lat, lon, stop.lat, stop.lon);
+      if (!best || dist < best.distance) {
+        best = { stopId: stop.stopId, stopSequence: stop.stopSequence, distance: dist };
+      }
     }
+    return best;
+  }
 
-    log(`[GTFS-RT] No match for bus ${busStr}`);
-    return { gtfs: 'no match' };
+  // Returns cached GTFS info for the bus. Called at tap time — no async fetch needed.
+  getGtfsInfo() {
+    const s = this._state;
+    if (!s.tripId) return { gtfs: 'no match' };
+    return { gtfs: 'match', route_id: s.routeId, trip_id: s.tripId, service_id: s.serviceId, stop_id: s.stopId };
   }
 }
 
@@ -499,7 +637,7 @@ const gtfsStaticCache = new GtfsStaticCache(CONFIG.gtfsStaticUrl);
 const gtfsCache = new GtfsRtCache(
   CONFIG.gtfsRtVehiclesUrl,
   CONFIG.gtfsRtTripsUrl,
-  CONFIG.gtfsRtTtlMs,
+  CONFIG.gtfsRtPollIntervalMs,
   gtfsStaticCache,
 );
 
@@ -548,10 +686,8 @@ async function processCard(cardNumber, devicePath, tapQueue, busNumber) {
 
   log(`[Process] ACCEPTED - ${cardNumber} (${reason})`);
 
-  const [{ latitude, longitude }, gtfsInfo] = await Promise.all([
-    fetchGps(),
-    gtfsCache.getGtfsInfo(busNumber),
-  ]);
+  const { latitude, longitude } = await fetchGps();
+  const gtfsInfo = gtfsCache.getGtfsInfo();
   log(`[Process] GPS: lat=${latitude}, lon=${longitude}`);
   log(`[Process] GTFS: ${JSON.stringify(gtfsInfo)}`);
 
@@ -823,10 +959,13 @@ async function main() {
   log('=== piTaps App Starting ===');
   log(`Config: server=${CONFIG.serverUrl}, baud=${CONFIG.serialBaud}, batch_interval=${CONFIG.batchIntervalMs / 1000}s`);
 
-  // Start static GTFS download in the background — will be ready before the first trip boundary is hit.
+  // Start static GTFS download in the background — enriches stop data for trip tracking.
   gtfsStaticCache.ensureLoaded();
 
   const busNumber = await fetchVehicleId();
+
+  // Start proactive GTFS-RT polling so stop info is ready before any tap occurs.
+  gtfsCache.startPolling(busNumber);
 
   const persistPath = path.join(APP_DIR, 'tap_queue.json');
   const tapQueue = new TapQueue(CONFIG.maxQueueSize, persistPath);
@@ -849,6 +988,7 @@ async function main() {
   const shutdown = () => {
     log('Shutting down...');
     clearInterval(heartbeat);
+    gtfsCache.stopPolling();
     batchSender.stop();
     monitor.stop();
     const remaining = tapQueue.size;
