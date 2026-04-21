@@ -289,9 +289,9 @@ class GtfsRtCache {
         if (String(veh.vehicle?.id ?? '') === busStr) {
           log(`[GTFS-RT] Found bus ${busStr} in vehicles feed`);
           fields = {
-            route_id: veh.trip?.route_id ?? null,
-            trip_id:  veh.trip?.trip_id  ?? null,
-            stop_id:  veh.stop_id        ?? null,
+            route_id: veh.trip?.routeId  ?? null,
+            trip_id:  veh.trip?.tripId   ?? null,
+            stop_id:  veh.stopId         ?? null,
           };
           break;
         }
@@ -302,20 +302,20 @@ class GtfsRtCache {
     const needsTrips = !fields || fields.route_id === null || fields.trip_id === null || fields.stop_id === null;
     if (needsTrips && this._tripsFeed?.entity) {
       for (const entity of this._tripsFeed.entity) {
-        const tu = entity.trip_update;
+        const tu = entity.tripUpdate;
         if (!tu) continue;
         if (String(tu.vehicle?.id ?? '') === busStr) {
           log(`[GTFS-RT] Found bus ${busStr} in trips feed`);
-          const stopId = tu.stop_time_update?.[0]?.stop_id ?? null;
+          const stopId = tu.stopTimeUpdate?.[0]?.stopId ?? null;
           if (!fields) {
             fields = {
-              route_id: tu.trip?.route_id ?? null,
-              trip_id:  tu.trip?.trip_id  ?? null,
+              route_id: tu.trip?.routeId ?? null,
+              trip_id:  tu.trip?.tripId  ?? null,
               stop_id:  stopId,
             };
           } else {
-            fields.route_id ??= tu.trip?.route_id ?? null;
-            fields.trip_id  ??= tu.trip?.trip_id  ?? null;
+            fields.route_id ??= tu.trip?.routeId ?? null;
+            fields.trip_id  ??= tu.trip?.tripId  ?? null;
             fields.stop_id  ??= stopId;
           }
           break;
