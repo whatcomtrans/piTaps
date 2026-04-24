@@ -231,6 +231,12 @@ class GtfsStaticCache {
     return this._stopTimes.get(String(tripId)) ?? null;
   }
 
+  // Returns the stop_code for a stop_id, or null if not loaded / not found.
+  getStopCode(stopId) {
+    if (!this._loaded || stopId == null) return null;
+    return this._stops.get(String(stopId))?.stop_code ?? null;
+  }
+
   // Returns {route_id, service_id} for a trip, or null if not loaded / not found.
   getTripInfo(tripId) {
     if (!this._loaded || tripId == null) return null;
@@ -296,18 +302,20 @@ class GtfsStaticCache {
       const lines   = csv.split('\n');
       const headers = lines[0].toLowerCase().replace(/\r/g, '').split(',').map((h) => h.trim());
       const idIdx   = headers.indexOf('stop_id');
+      const codeIdx = headers.indexOf('stop_code');
       const latIdx  = headers.indexOf('stop_lat');
       const lonIdx  = headers.indexOf('stop_lon');
       if (idIdx >= 0 && latIdx >= 0 && lonIdx >= 0) {
         for (let i = 1; i < lines.length; i++) {
           const line = lines[i].trim();
           if (!line) continue;
-          const cols   = line.split(',');
-          const stopId = cols[idIdx]?.trim();
-          const lat    = parseFloat(cols[latIdx]?.trim());
-          const lon    = parseFloat(cols[lonIdx]?.trim());
+          const cols      = line.split(',');
+          const stopId    = cols[idIdx]?.trim();
+          const stop_code = codeIdx >= 0 ? (cols[codeIdx]?.trim() || null) : null;
+          const lat       = parseFloat(cols[latIdx]?.trim());
+          const lon       = parseFloat(cols[lonIdx]?.trim());
           if (stopId && !isNaN(lat) && !isNaN(lon)) {
-            this._stops.set(stopId, { lat, lon });
+            this._stops.set(stopId, { lat, lon, stop_code });
           }
         }
         log(`[GTFS-Static] Loaded ${this._stops.size} stop coordinates`);
@@ -397,7 +405,7 @@ class GtfsRtCache {
     this._pollTimer      = null;
     this._polling        = false;
     // Continuously updated vehicle state (trip/route/service from static GTFS, stop from resolution logic)
-    this._state = { tripId: null, routeId: null, serviceId: null, stopId: null, lat: null, lon: null, updatedAt: null };
+    this._state = { tripId: null, routeId: null, serviceId: null, stopId: null, stopCode: null, lat: null, lon: null, updatedAt: null };
     // Enriched stop arrays for the current and previous trip (from static GTFS + stop coords)
     this._gtfsRtTripId      = null; // most recent trip ID as reported by GTFS-RT (for change detection)
     this._currentTripStops  = null; // [{stopSequence, stopId, lat, lon}]
@@ -544,12 +552,14 @@ class GtfsRtCache {
       const tripInfo = this._staticCache.getTripInfo(resolvedTripId);
       const routeId   = tripInfo?.route_id   ?? rtRouteId ?? this._state.routeId;
       const serviceId = tripInfo?.service_id ?? this._state.serviceId;
+      const stopCode  = this._staticCache.getStopCode(stopId);
 
       this._state = {
         tripId:    resolvedTripId,
         routeId,
         serviceId,
         stopId,
+        stopCode,
         lat:       gps.latitude,
         lon:       gps.longitude,
         updatedAt: Date.now(),
@@ -629,7 +639,7 @@ class GtfsRtCache {
   getGtfsInfo() {
     const s = this._state;
     if (!s.tripId) return { gtfs: 'no match' };
-    return { gtfs: 'match', route_id: s.routeId, trip_id: s.tripId, service_id: s.serviceId, stop_id: s.stopId };
+    return { gtfs: 'match', route_id: s.routeId, trip_id: s.tripId, service_id: s.serviceId, stop_id: s.stopId, stop_code: s.stopCode };
   }
 }
 
