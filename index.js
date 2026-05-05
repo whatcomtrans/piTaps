@@ -480,6 +480,9 @@ class GtfsRtCache {
     try {
       const [gps] = await Promise.all([fetchGps(), this._refresh()]);
 
+      // Retry static GTFS download if startup failed — fire-and-forget, result available next poll
+      if (!this._staticCache._loaded) this._staticCache.ensureLoaded();
+
       const busStr = this._busNumber;
       let rtTripId = null, rtRouteId = null, currentStopSeq = null, currentStatus = null;
 
