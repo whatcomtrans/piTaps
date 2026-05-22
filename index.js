@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const http = require('http');
+const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { SerialPort } = require('serialport');
 const { ReadlineParser } = require('@serialport/parser-readline');
 const GtfsRealtimeBindings = require('gtfs-realtime-bindings');
@@ -40,13 +41,50 @@ const CONFIG = {
   gtfsStaticUrl:           process.env.GTFS_STATIC_URL || 'https://github.com/whatcomtrans/publicwtadata/raw/master/GTFS/wta_gtfs_latest.zip',
 };
 
-if (!CONFIG.serverUrl || !CONFIG.apiKey) {
-  console.error('FATAL: SERVER_URL and API_KEY must be set in .env — see .env.example');
-  process.exit(1);
-}
-
 // Tracks last-seen timestamp (ms) per card number for cooldown enforcement.
 const recentCards = new Map();
+
+// --- Remote config (S3) ------------------------------------------------------
+
+const REMOTE_CONFIG_CACHE_PATH = path.join(APP_DIR, 'remote_config_cache.json');
+
+async function loadRemoteConfig() {
+  const bucket = process.env.S3_CONFIG_BUCKET;
+  const key    = process.env.S3_CONFIG_KEY || 'pitaps-config.json';
+  const region = process.env.AWS_REGION    || 'us-west-2';
+
+  if (!bucket) {
+    log('[Config] S3_CONFIG_BUCKET not set — SERVER_URL/API_KEY must be in .env');
+    return null;
+  }
+
+  try {
+    log(`[Config] Fetching fleet config from s3://${bucket}/${key}...`);
+    const client = new S3Client({ region });
+    const resp   = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    const chunks = [];
+    for await (const chunk of resp.Body) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const config = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    log(`[Config] Fleet config loaded (${Object.keys(config).join(', ')})`);
+    try { fs.writeFileSync(REMOTE_CONFIG_CACHE_PATH, JSON.stringify(config)); } catch (_) {}
+    return config;
+  } catch (e) {
+    log(`[Config] WARNING - S3 fetch failed: ${e.message}`);
+  }
+
+  try {
+    if (fs.existsSync(REMOTE_CONFIG_CACHE_PATH)) {
+      const config = JSON.parse(fs.readFileSync(REMOTE_CONFIG_CACHE_PATH, 'utf8'));
+      log('[Config] Using cached fleet config from last successful S3 fetch');
+      return config;
+    }
+  } catch (e) {
+    log(`[Config] WARNING - Fleet config cache unreadable: ${e.message}`);
+  }
+
+  log('[Config] No fleet config available from S3 or cache — falling back to .env');
+  return null;
+}
 
 // --- Logging -----------------------------------------------------------------
 
@@ -1129,6 +1167,16 @@ class DeviceMonitor {
 
 async function main() {
   log('=== piTaps App Starting ===');
+
+  const remoteConfig = await loadRemoteConfig();
+  if (remoteConfig?.SERVER_URL) CONFIG.serverUrl = remoteConfig.SERVER_URL;
+  if (remoteConfig?.API_KEY)    CONFIG.apiKey    = remoteConfig.API_KEY;
+
+  if (!CONFIG.serverUrl || !CONFIG.apiKey) {
+    log('FATAL: SERVER_URL and API_KEY not available — check S3 config or add them to .env');
+    process.exit(1);
+  }
+
   log(`Config: server=${CONFIG.serverUrl}, baud=${CONFIG.serialBaud}, batch_interval=${CONFIG.batchIntervalMs / 1000}s`);
 
   // Start static GTFS download in the background — enriches stop data for trip tracking.

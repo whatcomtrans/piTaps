@@ -39,11 +39,15 @@ Reads card taps from an Elatec TWN4 MultiTech2 USB card reader, queues them loca
 
 Before inserting the SD card into the Pi, add one file to the **boot partition**. The boot partition is FAT32 and mounts automatically on Windows or macOS when the SD card is inserted.
 
+> **First time only:** Before flashing any Pi, complete [S3_CONFIG_SETUP.md](S3_CONFIG_SETUP.md) to create the S3 bucket and config file. Fleet-wide settings (`SERVER_URL`, `API_KEY`) live there — not in the file below.
+
 Copy [`.env.example`](.env.example) to a file named `pitaps.env` and fill in the real values:
 
 ```
-SERVER_URL=https://YOUR-ID.execute-api.us-west-2.amazonaws.com/prod/taps
-API_KEY=your-real-api-key
+AWS_REGION=us-west-2
+S3_CONFIG_BUCKET=your-pitaps-config-bucket
+AWS_ACCESS_KEY_ID=your-iam-access-key-id
+AWS_SECRET_ACCESS_KEY=your-iam-secret-access-key
 GITHUB_REPO_URL=https://github.com/YOUR-ORG/piTaps.git
 ROUTER_HOST=192.168.0.1
 ROUTER_API_USERNAME=
@@ -54,7 +58,7 @@ Copy `pitaps.env` to the **root of the boot partition** (the drive that appears 
 
 > On Raspberry Pi OS Trixie the boot partition is mounted at `/boot/firmware` on the running Pi — not `/boot`. If you ever need to access it from the Pi itself, use that path.
 
-> **This file is identical for every Pi in the fleet.** Vehicle identity (bus number) is read at runtime from the Cradlepoint router's SDK appdata — no per-Pi customization is needed on the SD card.
+> **This file is identical for every Pi in the fleet.** Vehicle identity comes from the Cradlepoint router at runtime. When `SERVER_URL` or `API_KEY` change, update the S3 config file — no SD card or Pi changes needed.
 
 Eject the SD card and insert it into the Pi.
 
@@ -346,7 +350,7 @@ After flashing, mount the boot partition (it appears as a small FAT32 drive) and
 
 | File | Contents | Same for all? |
 |---|---|---|
-| `pitaps.env` | Your real `.env` file | ✅ Yes — identical for every vehicle |
+| `pitaps.env` | AWS S3 credentials + router config | ✅ Yes — identical for every vehicle |
 
 That's it. The first-boot script:
 - Regenerates unique SSH host keys (so each Pi is cryptographically distinct even though the image is identical)
@@ -362,11 +366,27 @@ That's it. The first-boot script:
 
 ## Environment Variables Reference
 
+### S3 config file (`pitaps-config.json` in your S3 bucket)
+
+These values are fleet-wide. Update the S3 file to propagate a change to all vehicles on their next reboot — no Pi access needed.
+
+| Key | Required | Description |
+|---|---|---|
+| `SERVER_URL` | ✅ | AWS API Gateway endpoint URL for tap delivery |
+| `API_KEY` | ✅ | API authentication key sent as `x-api-key` header |
+
+### `.env` on each Pi (via `pitaps.env` on the boot partition)
+
+These values are set once per golden image and almost never change.
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `SERVER_URL` | ✅ | — | AWS API Gateway endpoint URL |
-| `API_KEY` | ✅ | — | API authentication key sent as `x-api-key` header |
-| `GITHUB_REPO_URL` | ✅ | — | Public GitHub repo URL for auto-updates |
+| `AWS_REGION` | ✅ | — | AWS region of the S3 config bucket (e.g. `us-west-2`) |
+| `S3_CONFIG_BUCKET` | ✅ | — | S3 bucket name holding `pitaps-config.json` |
+| `S3_CONFIG_KEY` | — | `pitaps-config.json` | S3 object key for the config file |
+| `AWS_ACCESS_KEY_ID` | ✅ | — | IAM access key (read-only access to config bucket) |
+| `AWS_SECRET_ACCESS_KEY` | ✅ | — | IAM secret key |
+| `GITHUB_REPO_URL` | ✅ | — | Public GitHub repo URL for auto-updates on reboot |
 | `ROUTER_HOST` | — | `192.168.0.1` | Cradlepoint router IP for GPS and vehicle ID lookup |
 | `ROUTER_API_USERNAME` | — | *(empty)* | Cradlepoint API username (if required) |
 | `ROUTER_API_PASSWORD` | — | *(empty)* | Cradlepoint API password (if required) |
@@ -375,8 +395,15 @@ That's it. The first-boot script:
 
 ## Troubleshooting
 
-**App won't start — "FATAL: SERVER_URL and API_KEY must be set"**
-The `.env` file is missing or incomplete. Check `/opt/pitaps/.env` exists and contains both required variables.
+**App won't start — "FATAL: SERVER_URL and API_KEY not available"**
+The app couldn't find these values from S3, the local cache, or `.env`. Check:
+- `/opt/pitaps/.env` has `S3_CONFIG_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+- The Pi has internet access: `ping 8.8.8.8`
+- The IAM user has `s3:GetObject` permission on the config object
+- The config file exists in S3: `aws s3 cp s3://your-bucket/pitaps-config.json .`
+
+**S3 fetch failed at startup but app is running**
+The app fell back to its locally cached copy of the last successful S3 fetch (`/opt/pitaps/remote_config_cache.json`). This is normal during brief connectivity outages. Check logs for the specific S3 error.
 
 **No card reads — "No serial device found"**
 - Confirm the Elatec reader is plugged into a USB port: `ls /dev/ttyACM* /dev/ttyUSB*`
