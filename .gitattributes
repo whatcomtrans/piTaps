@@ -1,0 +1,8 @@
+# Enforce LF line endings for all text files on all platforms.
+# This ensures files deployed to Linux (Raspberry Pi) always have LF,
+# even when the repo is cloned and edited on Windows.
+* text=auto eol=lf
+
+# Explicitly mark binary files to prevent any line ending conversion.
+*.zip binary
+package-lock.json binary
