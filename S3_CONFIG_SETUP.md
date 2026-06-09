@@ -184,3 +184,37 @@ To force an immediate update on one Pi without rebooting:
 ```bash
 sudo systemctl restart pitaps
 ```
+
+---
+
+## Card Validation Lists (optional)
+
+If you want the reader to show a green light for valid cards and red for invalid, add a `CARD_LISTS` key to `pitaps-config.json` pointing to plain-text card number files (one card number per line, `#` lines are comments):
+
+```json
+{
+  "SERVER_URL": "https://825cvaskdc.execute-api.us-west-2.amazonaws.com/prod/taps",
+  "API_KEY": "your-api-key",
+  "CARD_LISTS": {
+    "youth":   "https://example.com/cards/youth.txt",
+    "student": "https://example.com/cards/student.txt",
+    "staff":   "https://example.com/cards/staff.txt"
+  }
+}
+```
+
+Each list file is a plain text file, one card number per line:
+```
+# Youth card numbers
+1234567890ABCDEF
+0987654321FEDCBA
+```
+
+**Behavior:**
+- Card **found** in a list → green LED + success beep; `list_name` field added to tap record
+- Card **not found** in any list → red LED + error beep; tap still recorded (no `list_name`)
+- **No `CARD_LISTS` configured** → pass-through mode — all format-valid cards accepted, no list checking
+
+**Hosting the list files:** The URLs can be any HTTPS endpoint the Pi can reach — a public or pre-signed S3 URL, an internal web server, GitHub raw content, etc. Lists are loaded at startup; restart the service to pick up list changes.
+
+> **Requires modified reader firmware** — see `patch_abt.py` and `DevPack/` in the repo for instructions on building the firmware image that supports host-controlled feedback.

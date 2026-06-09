@@ -44,6 +44,9 @@ const CONFIG = {
 // Tracks last-seen timestamp (ms) per card number for cooldown enforcement.
 const recentCards = new Map();
 
+// Feedback bytes sent back to the Elatec reader after each tap.
+const FEEDBACK = { VALID: 0x47, INVALID: 0x52 };  // 'G', 'R'
+
 // --- Remote config (S3) ------------------------------------------------------
 
 const REMOTE_CONFIG_CACHE_PATH = path.join(APP_DIR, 'remote_config_cache.json');
@@ -851,6 +854,91 @@ const gtfsCache = new GtfsRtCache(
   gtfsStaticCache,
 );
 
+// --- Card Validation Lists ---------------------------------------------------
+
+function fetchText(urlStr, redirectsLeft = 5) {
+  return new Promise((resolve, reject) => {
+    if (redirectsLeft <= 0) return reject(new Error('Too many redirects'));
+    const url = new URL(urlStr);
+    const lib = url.protocol === 'https:' ? https : http;
+    const chunks = [];
+    const req = lib.request({
+      hostname: url.hostname,
+      path: url.pathname + url.search,
+      method: 'GET',
+      headers: { 'User-Agent': 'piTaps/1.0' },
+      timeout: 30_000,
+    }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
+        resolve(fetchText(res.headers.location, redirectsLeft - 1));
+        return;
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Timed out')); });
+    req.end();
+  });
+}
+
+// Downloads and caches card validation lists. checkCard() returns the list name
+// the card was found in (string), false if no lists matched, or null if no lists
+// are configured (validation disabled — all cards pass through).
+class CardValidationCache {
+  constructor() {
+    this._lists = new Map();  // listName → Set<string>
+    this._configured = false;
+  }
+
+  async load(cardLists) {
+    this._configured = true;
+    const entries = Object.entries(cardLists);
+    if (entries.length === 0) return;
+
+    const results = await Promise.allSettled(
+      entries.map(async ([name, url]) => {
+        let text;
+        if (/^https?:\/\//i.test(url)) {
+          text = await fetchText(url);
+        } else {
+          const resolved = path.resolve(url);
+          if (resolved !== url || url.includes('..')) throw new Error(`Card list path must be absolute with no traversal: ${url}`);
+          text = fs.readFileSync(resolved, 'utf8');
+        }
+        const cards = text.split('\n')
+          .map((line) => line.trim())
+          .filter((line) => line && !line.startsWith('#'));
+        this._lists.set(name, new Set(cards));
+        log(`[CardLists] Loaded ${cards.length} ${name} cards from ${url}`);
+      })
+    );
+
+    for (const r of results) {
+      if (r.status === 'rejected') {
+        log(`[CardLists] WARNING - Failed to load a list: ${r.reason?.message}`);
+      }
+    }
+  }
+
+  // Returns list name if card is valid, false if explicitly invalid,
+  // null if no lists are configured (pass-through mode).
+  checkCard(cardNumber) {
+    if (!this._configured || this._lists.size === 0) return null;
+    for (const [name, cards] of this._lists) {
+      if (cards.has(cardNumber)) return name;
+    }
+    return false;
+  }
+}
+
+const cardValidationCache = new CardValidationCache();
+
 // --- Card Validation & Processing --------------------------------------------
 
 function validateCardNumber(cardNumber) {
@@ -872,13 +960,15 @@ function validateCardNumber(cardNumber) {
   return { valid: false, reason: 'Invalid characters in card number' };
 }
 
+// Returns a feedback byte for the Elatec reader (FEEDBACK.VALID / FEEDBACK.INVALID),
+// or null if no feedback should be sent (duplicates — reader already signalled).
 async function processCard(cardNumber, devicePath, tapQueue, busNumber) {
   log(`[Process] Card from ${devicePath}: "${cardNumber}"`);
 
   const { valid, reason } = validateCardNumber(cardNumber);
   if (!valid) {
     log(`[Process] REJECTED - ${reason}`);
-    return false;
+    return FEEDBACK.INVALID;
   }
 
   // Cooldown: ignore re-reads of the same card within the cooldown window.
@@ -886,7 +976,7 @@ async function processCard(cardNumber, devicePath, tapQueue, busNumber) {
   const lastSeen = recentCards.get(cardNumber) ?? 0;
   if (now - lastSeen < CONFIG.cardCooldownMs) {
     log(`[Process] DUPLICATE - ${cardNumber} seen ${now - lastSeen}ms ago, ignoring`);
-    return false;
+    return null;
   }
   recentCards.set(cardNumber, now);
   // Prune entries older than the cooldown so the map doesn't grow unbounded.
@@ -901,17 +991,26 @@ async function processCard(cardNumber, devicePath, tapQueue, busNumber) {
   log(`[Process] GPS: lat=${latitude}, lon=${longitude}`);
   log(`[Process] GTFS: ${JSON.stringify(gtfsInfo)}`);
 
+  // Check card against validation lists.
+  // null = lists not configured (pass-through); false = not in any list; string = list name
+  const listMatch = cardValidationCache.checkCard(cardNumber);
+  const listName = typeof listMatch === 'string' ? listMatch : undefined;
+  log(`[Process] Card list: ${listMatch === null ? 'validation not configured' : listMatch === false ? 'not in any list' : `found in "${listMatch}"`}`);
+
   tapQueue.enqueue({
     card_number: cardNumber,
     timestamp_utc: new Date().toISOString().slice(0, 19) + 'Z',
     latitude,
     longitude,
     bus_number: busNumber,
+    ...(listName !== undefined ? { list_name: listName } : {}),
     ...gtfsInfo,
   });
 
-  log(`[Process] Tap enqueued: card=${cardNumber}, bus=${busNumber}, gps=(${latitude},${longitude}), gtfs=${gtfsInfo.gtfs}`);
-  return true;
+  log(`[Process] Tap enqueued: card=${cardNumber}, bus=${busNumber}, gps=(${latitude},${longitude}), gtfs=${gtfsInfo.gtfs}${listName ? `, list=${listName}` : ''}`);
+
+  // listMatch === false → not in any list → reject; null or string → accept
+  return listMatch === false ? FEEDBACK.INVALID : FEEDBACK.VALID;
 }
 
 // --- Batch Sender ------------------------------------------------------------
@@ -1046,11 +1145,17 @@ class SerialCardReader {
 
       parser.on('data', (line) => {
         const cardNumber = line.trim();
-        if (cardNumber) {
-          log(`>>> Card tap on ${this._devicePath}: "${cardNumber}" <<<`);
-          processCard(cardNumber, this._devicePath, this._tapQueue, this._busNumber)
-            .catch((e) => log(`[Process] Error: ${e.message}`));
-        }
+        if (!cardNumber) return;
+        log(`>>> Card tap on ${this._devicePath}: "${cardNumber}" <<<`);
+        processCard(cardNumber, this._devicePath, this._tapQueue, this._busNumber)
+          .then((feedbackByte) => {
+            if (feedbackByte !== null && this._port?.isOpen) {
+              this._port.write(Buffer.from([feedbackByte]), (err) => {
+                if (err) log(`[Serial] Feedback write error on ${this._devicePath}: ${err.message}`);
+              });
+            }
+          })
+          .catch((e) => log(`[Process] Error: ${e.message}`));
       });
 
       this._port.on('close', () => {
@@ -1175,6 +1280,24 @@ async function main() {
   if (!CONFIG.serverUrl || !CONFIG.apiKey) {
     log('FATAL: SERVER_URL and API_KEY not available — check S3 config or add them to .env');
     process.exit(1);
+  }
+
+  const cardLists = remoteConfig?.CARD_LISTS ?? (() => {
+    // Fall back to CARD_LIST_<NAME> env vars (e.g. CARD_LIST_YOUTH, CARD_LIST_STUDENT)
+    const lists = {};
+    for (const [key, val] of Object.entries(process.env)) {
+      if (key.startsWith('CARD_LIST_') && val) {
+        lists[key.slice('CARD_LIST_'.length).toLowerCase()] = val;
+      }
+    }
+    return Object.keys(lists).length > 0 ? lists : null;
+  })();
+
+  if (cardLists) {
+    log('[CardLists] Loading card validation lists...');
+    await cardValidationCache.load(cardLists);
+  } else {
+    log('[CardLists] No card lists configured — running in pass-through mode (all valid cards accepted)');
   }
 
   log(`Config: server=${CONFIG.serverUrl}, baud=${CONFIG.serialBaud}, batch_interval=${CONFIG.batchIntervalMs / 1000}s`);
