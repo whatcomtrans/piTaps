@@ -5,3 +5,5 @@ tap_queue.json.tmp
 .claude/
 DevPack/
 remote_config_cache.json
+card_list_*.json
+card_list_*.json.tmp

@@ -187,9 +187,34 @@ sudo systemctl restart pitaps
 
 ---
 
-## Card Validation Lists (optional)
+## Card List Sync (preferred)
 
-If you want the reader to show a green light for valid cards and red for invalid, add a `CARD_LISTS` key to `pitaps-config.json` pointing to plain-text card number files (one card number per line, `#` lines are comments):
+By default each Pi keeps the `youth`, `student`, and `staff` card lists in sync with the taps API (`https://api.taps.ridewta.com`), using the same API key as tap batches:
+
+- **On startup** — a full list pull (`GET /lists/{type}`), or a resume from the locally persisted copy if one exists and passes its checksum. A persisted list from a previous day is used immediately while the network comes up.
+- **Every minute** — an incremental delta pull (`GET /lists/{type}/changes?since=<token>`) applies per-card adds/removes. Every update is verified against the server's SHA-256 list checksum before it takes effect; a mismatch triggers a fresh full pull.
+- Verified state is persisted to `card_list_<type>.json` next to the app, so a restart doesn't re-download.
+- Sync failures never affect tap reading — the last verified list stays in effect.
+
+To point the fleet at a different API (or disable sync with `"off"`), add `CARD_LIST_SYNC_URL` to `pitaps-config.json`:
+
+```json
+{
+  "SERVER_URL": "https://825cvaskdc.execute-api.us-west-2.amazonaws.com/prod/taps",
+  "API_KEY": "your-api-key",
+  "CARD_LIST_SYNC_URL": "https://api.taps.ridewta.com"
+}
+```
+
+If no list has ever been uploaded to the backend, the Pi stays in pass-through mode (all format-valid cards accepted).
+
+---
+
+## Card Validation Lists (legacy static URLs)
+
+If `CARD_LISTS` is present in `pitaps-config.json`, it **takes precedence over card list sync** — the lists are downloaded once at startup from the given URLs and never updated until restart. Remove `CARD_LISTS` from the config to use the sync protocol above.
+
+Point `CARD_LISTS` at plain-text card number files (one card number per line, `#` lines are comments):
 
 ```json
 {

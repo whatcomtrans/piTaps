@@ -4,7 +4,8 @@
   "description": "Reads card taps from an Elatech reader and sends the resulting card info to AWS",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node --test test/"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.0.0",

@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const http = require('http');
+const crypto = require('crypto');
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { SerialPort } = require('serialport');
 const { ReadlineParser } = require('@serialport/parser-readline');
@@ -39,6 +40,8 @@ const CONFIG = {
   backfillWindowSecs:      900,    // ±15 min buffer around scheduled trip window for back-fill
   gtfsTimezone:            process.env.GTFS_TIMEZONE || 'America/Los_Angeles',
   gtfsStaticUrl:           process.env.GTFS_STATIC_URL || 'https://github.com/whatcomtrans/publicwtadata/raw/master/GTFS/wta_gtfs_latest.zip',
+  cardListSyncUrl:         process.env.CARD_LIST_SYNC_URL || 'https://api.taps.ridewta.com',
+  cardListSyncIntervalMs:  parseInt(process.env.CARD_LIST_SYNC_INTERVAL_MS, 10) || 60_000,
 };
 
 // Tracks last-seen timestamp (ms) per card number for cooldown enforcement.
@@ -856,7 +859,7 @@ const gtfsCache = new GtfsRtCache(
 
 // --- Card Validation Lists ---------------------------------------------------
 
-function fetchText(urlStr, redirectsLeft = 5) {
+function fetchText(urlStr, redirectsLeft = 5, headers = {}) {
   return new Promise((resolve, reject) => {
     if (redirectsLeft <= 0) return reject(new Error('Too many redirects'));
     const url = new URL(urlStr);
@@ -866,12 +869,12 @@ function fetchText(urlStr, redirectsLeft = 5) {
       hostname: url.hostname,
       path: url.pathname + url.search,
       method: 'GET',
-      headers: { 'User-Agent': 'piTaps/1.0' },
+      headers: { 'User-Agent': 'piTaps/1.0', ...headers },
       timeout: 30_000,
     }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
-        resolve(fetchText(res.headers.location, redirectsLeft - 1));
+        resolve(fetchText(res.headers.location, redirectsLeft - 1, headers));
         return;
       }
       if (res.statusCode !== 200) {
@@ -885,6 +888,10 @@ function fetchText(urlStr, redirectsLeft = 5) {
     req.on('timeout', () => { req.destroy(); reject(new Error('Timed out')); });
     req.end();
   });
+}
+
+async function fetchJson(urlStr, headers = {}) {
+  return JSON.parse(await fetchText(urlStr, 5, headers));
 }
 
 // Downloads and caches card validation lists. checkCard() returns the list name
@@ -926,6 +933,15 @@ class CardValidationCache {
     }
   }
 
+  // Atomically swaps in a new card set for a list (a Map.set of a fully built
+  // Set — tap checking never sees a half-applied list). `authoritative` marks
+  // the list as server-backed: until at least one list is authoritative,
+  // checkCard() stays in pass-through mode.
+  setList(name, cards, authoritative = true) {
+    this._lists.set(name, cards);
+    if (authoritative) this._configured = true;
+  }
+
   // Returns list name if card is valid, false if explicitly invalid,
   // null if no lists are configured (pass-through mode).
   checkCard(cardNumber) {
@@ -938,6 +954,199 @@ class CardValidationCache {
 }
 
 const cardValidationCache = new CardValidationCache();
+
+// --- Card List Sync ------------------------------------------------------------
+//
+// Keeps local copies of the youth/student/staff card lists in sync with the
+// taps API (same API key as tap batches):
+//   GET /lists/{type}                    → full list + token + checksum
+//   GET /lists/{type}/changes?since=<t>  → 'current' | 'delta' | 'resync'
+// The server checksum is the correctness backstop: it is verified after every
+// full pull and delta application, and verified state (list + token +
+// checksum) is persisted atomically so a restart resumes from the last good
+// token. Sync failures never touch the tap path — the previous list stays in
+// effect and the next cycle retries.
+
+const CARD_LIST_TYPES = ['youth', 'student', 'staff'];
+const CARD_SYNC_INITIAL_RETRY_MS = 5_000;
+
+// Canonical list checksum — must match the backend byte-for-byte:
+// trim, drop empties, uppercase, de-duplicate, sort ascending, join with LF
+// (no trailing newline), UTF-8, SHA-256 lowercase hex.
+function listChecksum(cardNumbers) {
+  const normalized = [...new Set(
+    [...cardNumbers].map((c) => String(c).trim().toUpperCase()).filter(Boolean)
+  )].sort();
+  return crypto.createHash('sha256').update(normalized.join('\n'), 'utf8').digest('hex');
+}
+
+class CardListSyncClient {
+  constructor({ baseUrl, apiKey, persistDir, intervalMs, cache, fetchJsonFn = fetchJson }) {
+    this._baseUrl = String(baseUrl).replace(/\/+$/, '');
+    this._apiKey = apiKey;
+    this._persistDir = persistDir;
+    this._intervalMs = intervalMs;
+    this._cache = cache;
+    this._fetchJson = fetchJsonFn;
+    this._state = new Map();   // type → {token, checksum, cards: Set}
+    this._timers = new Map();  // type → setTimeout handle
+    this._retryMs = new Map(); // type → boot backoff delay (present until first successful sync)
+    this._stopped = false;
+  }
+
+  _statePath(type) {
+    return path.join(this._persistDir, `card_list_${type}.json`);
+  }
+
+  // Loads state persisted by a previous run and swaps it into the cache
+  // immediately — a day-old list beats no list while the first sync retries.
+  // State that is malformed or fails its checksum is ignored, which forces a
+  // full pull on the first cycle.
+  loadPersisted() {
+    for (const type of CARD_LIST_TYPES) {
+      const p = this._statePath(type);
+      try {
+        if (!fs.existsSync(p)) continue;
+        const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+        if (!Number.isInteger(data.token) || !Array.isArray(data.cards)) {
+          log(`[CardSync] WARNING - ${type}: persisted state malformed — ignoring, will full-pull`);
+          continue;
+        }
+        if (data.checksum != null && listChecksum(data.cards) !== data.checksum) {
+          log(`[CardSync] WARNING - ${type}: persisted state failed checksum — ignoring, will full-pull`);
+          continue;
+        }
+        this._commit(type, data.token, data.checksum ?? null, new Set(data.cards), { persist: false });
+        log(`[CardSync] ${type}: recovered ${data.cards.length} cards from disk (token ${data.token})`);
+      } catch (e) {
+        log(`[CardSync] WARNING - ${type}: failed to load persisted state: ${e.message}`);
+      }
+    }
+  }
+
+  // Starts the per-type sync loops: first cycle immediately, then every
+  // intervalMs. Until a type's first successful sync, failures retry with
+  // backoff (5s → 10s → … capped at intervalMs) so a Pi that boots before
+  // the network is up catches up quickly.
+  start() {
+    log(`[CardSync] Syncing [${CARD_LIST_TYPES.join(', ')}] from ${this._baseUrl} every ${this._intervalMs / 1000}s`);
+    for (const type of CARD_LIST_TYPES) {
+      this._retryMs.set(type, CARD_SYNC_INITIAL_RETRY_MS);
+      this._runCycle(type);
+    }
+  }
+
+  stop() {
+    this._stopped = true;
+    for (const timer of this._timers.values()) clearTimeout(timer);
+    this._timers.clear();
+  }
+
+  async _runCycle(type) {
+    let ok = false;
+    try {
+      ok = await this._syncType(type);
+    } catch (e) {
+      log(`[CardSync] WARNING - ${type}: sync failed: ${e.message}`);
+    }
+    if (this._stopped) return;
+    let delay = this._intervalMs;
+    if (ok) {
+      this._retryMs.delete(type);
+    } else if (this._retryMs.has(type)) {
+      delay = Math.min(this._retryMs.get(type), this._intervalMs);
+      this._retryMs.set(type, delay * 2);
+    }
+    this._timers.set(type, setTimeout(() => this._runCycle(type), delay));
+  }
+
+  // One sync cycle for one type. Returns true when the server was reached and
+  // verified state was committed (or confirmed current), false otherwise.
+  async _syncType(type) {
+    const st = this._state.get(type);
+    if (!st) return this._fullPull(type);
+    return this._deltaSync(type, st);
+  }
+
+  _get(apiPath) {
+    return this._fetchJson(`${this._baseUrl}${apiPath}`, { 'x-api-key': this._apiKey });
+  }
+
+  async _fullPull(type) {
+    const resp = await this._get(`/lists/${type}`);
+    const cards = new Set(
+      (resp.cards ?? []).map((c) => String(c).trim().toUpperCase()).filter(Boolean)
+    );
+    // checksum null means the university has never uploaded this type — an
+    // empty list is a legitimate state, committed as non-authoritative.
+    if (resp.checksum != null && listChecksum(cards) !== resp.checksum) {
+      log(`[CardSync] ERROR - ${type}: full pull failed checksum verification — will retry next cycle`);
+      return false;
+    }
+    this._commit(type, resp.token, resp.checksum ?? null, cards);
+    log(`[CardSync] ${type}: full pull → ${cards.size} cards (token ${resp.token})`);
+    return true;
+  }
+
+  async _deltaSync(type, st) {
+    const resp = await this._get(`/lists/${type}/changes?since=${st.token}`);
+
+    if (resp.status === 'current') {
+      if (resp.checksum !== st.checksum) {
+        log(`[CardSync] WARNING - ${type}: server says current but checksums differ — doing full pull`);
+        return this._fullPull(type);
+      }
+      log(`[CardSync] ${type}: current (token ${st.token})`);
+      return true;
+    }
+
+    if (resp.status === 'resync') {
+      log(`[CardSync] ${type}: RESYNC requested by server — doing full pull`);
+      return this._fullPull(type);
+    }
+
+    if (resp.status !== 'delta') {
+      log(`[CardSync] WARNING - ${type}: unexpected status "${resp.status}" — will retry next cycle`);
+      return false;
+    }
+
+    // puts/deletes are pre-collapsed to the net effect per card, so apply
+    // order doesn't matter. Work on a copy — the live set is only swapped
+    // after the checksum verifies.
+    const cards = new Set(st.cards);
+    const deletes = resp.deletes ?? [];
+    const puts = resp.puts ?? [];
+    for (const c of deletes) cards.delete(String(c).trim().toUpperCase());
+    for (const c of puts) {
+      const n = String(c).trim().toUpperCase();
+      if (n) cards.add(n);
+    }
+    if (resp.checksum == null || listChecksum(cards) !== resp.checksum) {
+      log(`[CardSync] WARNING - ${type}: checksum mismatch after applying delta — falling back to full pull`);
+      return this._fullPull(type);
+    }
+    this._commit(type, resp.token, resp.checksum, cards);
+    log(`[CardSync] ${type}: delta applied +${puts.length}/-${deletes.length} → ${cards.size} cards (token ${resp.token})`);
+    return true;
+  }
+
+  // Swaps verified state into memory + the validation cache, then persists it
+  // atomically (write-temp-then-rename — a power cut mid-write must not
+  // corrupt the list).
+  _commit(type, token, checksum, cards, { persist = true } = {}) {
+    this._state.set(type, { token, checksum, cards });
+    this._cache.setList(type, cards, checksum != null);
+    if (!persist) return;
+    try {
+      const p = this._statePath(type);
+      const tmp = p + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify({ list_type: type, token, checksum, cards: [...cards].sort() }));
+      fs.renameSync(tmp, p);
+    } catch (e) {
+      log(`[CardSync] WARNING - ${type}: failed to persist state: ${e.message}`);
+    }
+  }
+}
 
 // --- Card Validation & Processing --------------------------------------------
 
@@ -1276,6 +1485,7 @@ async function main() {
   const remoteConfig = await loadRemoteConfig();
   if (remoteConfig?.SERVER_URL) CONFIG.serverUrl = remoteConfig.SERVER_URL;
   if (remoteConfig?.API_KEY)    CONFIG.apiKey    = remoteConfig.API_KEY;
+  if (remoteConfig?.CARD_LIST_SYNC_URL !== undefined) CONFIG.cardListSyncUrl = remoteConfig.CARD_LIST_SYNC_URL;
 
   if (!CONFIG.serverUrl || !CONFIG.apiKey) {
     log('FATAL: SERVER_URL and API_KEY not available — check S3 config or add them to .env');
@@ -1293,9 +1503,22 @@ async function main() {
     return Object.keys(lists).length > 0 ? lists : null;
   })();
 
+  let cardListSync = null;
   if (cardLists) {
+    // Legacy static-URL lists (CARD_LISTS / CARD_LIST_*) take precedence when
+    // explicitly configured — remove them from the fleet config to use sync.
     log('[CardLists] Loading card validation lists...');
     await cardValidationCache.load(cardLists);
+  } else if (CONFIG.cardListSyncUrl && String(CONFIG.cardListSyncUrl).toLowerCase() !== 'off') {
+    cardListSync = new CardListSyncClient({
+      baseUrl: CONFIG.cardListSyncUrl,
+      apiKey: CONFIG.apiKey,
+      persistDir: APP_DIR,
+      intervalMs: CONFIG.cardListSyncIntervalMs,
+      cache: cardValidationCache,
+    });
+    cardListSync.loadPersisted();
+    cardListSync.start();
   } else {
     log('[CardLists] No card lists configured — running in pass-through mode (all valid cards accepted)');
   }
@@ -1332,6 +1555,7 @@ async function main() {
     log('Shutting down...');
     clearInterval(heartbeat);
     gtfsCache.stopPolling();
+    cardListSync?.stop();
     batchSender.stop();
     monitor.stop();
     const remaining = tapQueue.size;
@@ -1348,7 +1572,16 @@ async function main() {
   log('=== piTaps App Running ===');
 }
 
-main().catch((err) => {
-  log(`FATAL: ${err.message}`);
-  process.exit(1);
-});
+module.exports = {
+  listChecksum,
+  CardListSyncClient,
+  CardValidationCache,
+  CARD_LIST_TYPES,
+};
+
+if (require.main === module) {
+  main().catch((err) => {
+    log(`FATAL: ${err.message}`);
+    process.exit(1);
+  });
+}
